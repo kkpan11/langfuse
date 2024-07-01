@@ -11,36 +11,53 @@ import {
 } from "@/src/components/ui/dropdown-menu";
 import { useQueryParams, withDefault, NumberParam } from "use-query-params";
 
-import { Archive, MoreVertical } from "lucide-react";
+import { Archive, ListTree, MoreVertical } from "lucide-react";
 import { Button } from "@/src/components/ui/button";
-import { type DatasetItem, DatasetStatus } from "@langfuse/shared";
+import { type DatasetItem, DatasetStatus, type Prisma } from "@langfuse/shared";
 import { cn } from "@/src/utils/tailwind";
 import { type LangfuseColumnDef } from "@/src/components/table/types";
 import { useDetailPageLists } from "@/src/features/navigate-detail-pages/context";
 import { useEffect } from "react";
+import { DataTableToolbar } from "@/src/components/table/data-table-toolbar";
+import useColumnVisibility from "@/src/features/column-visibility/hooks/useColumnVisibility";
+import { useRowHeightLocalStorage } from "@/src/components/table/data-table-row-height-switch";
+import { IOTableCell } from "@/src/components/ui/CodeJsonViewer";
+import { usePostHogClientCapture } from "@/src/features/posthog-analytics/usePostHogClientCapture";
 
 type RowData = {
   id: string;
+  source?: {
+    traceId: string;
+    observationId?: string;
+  };
   status: DatasetItem["status"];
   createdAt: string;
-  input: string;
-  expectedOutput: string;
+  input: Prisma.JsonValue;
+  expectedOutput: Prisma.JsonValue;
+  metadata: Prisma.JsonValue;
 };
 
 export function DatasetItemsTable({
   projectId,
   datasetId,
+  menuItems,
 }: {
   projectId: string;
   datasetId: string;
+  menuItems?: React.ReactNode;
 }) {
   const { setDetailPageList } = useDetailPageLists();
   const utils = api.useUtils();
-
+  const capture = usePostHogClientCapture();
   const [paginationState, setPaginationState] = useQueryParams({
     pageIndex: withDefault(NumberParam, 0),
     pageSize: withDefault(NumberParam, 50),
   });
+
+  const [rowHeight, setRowHeight] = useRowHeightLocalStorage(
+    "datasetItems",
+    "s",
+  );
 
   const items = api.datasets.itemsByDatasetId.useQuery({
     projectId,
@@ -67,6 +84,7 @@ export function DatasetItemsTable({
     {
       accessorKey: "id",
       header: "Item id",
+      id: "id",
       cell: ({ row }) => {
         const id: string = row.getValue("id");
         return (
@@ -79,8 +97,35 @@ export function DatasetItemsTable({
       },
     },
     {
+      accessorKey: "source",
+      header: "Source",
+      headerTooltip: {
+        description:
+          "Link to the source trace based on which this item was added",
+      },
+      id: "source",
+      cell: ({ row }) => {
+        const source: RowData["source"] = row.getValue("source");
+        if (!source) return null;
+        return source.observationId ? (
+          <TableLink
+            path={`/project/${projectId}/traces/${source.traceId}?observation=${source.observationId}`}
+            value={source.observationId}
+            icon={<ListTree className="h-4 w-4" />}
+          />
+        ) : (
+          <TableLink
+            path={`/project/${projectId}/traces/${source.traceId}`}
+            value={source.traceId}
+            icon={<ListTree className="h-4 w-4" />}
+          />
+        );
+      },
+    },
+    {
       accessorKey: "status",
       header: "Status",
+      id: "status",
       cell: ({ row }) => {
         const status: DatasetStatus = row.getValue("status");
         return (
@@ -89,8 +134,8 @@ export function DatasetItemsTable({
               className={cn(
                 "h-2 w-2 rounded-full",
                 status === DatasetStatus.ACTIVE
-                  ? "bg-green-600"
-                  : "bg-yellow-600",
+                  ? "bg-dark-green"
+                  : "bg-dark-yellow",
               )}
             />
             <span>{status}</span>
@@ -100,15 +145,51 @@ export function DatasetItemsTable({
     },
     {
       accessorKey: "createdAt",
-      header: "Created",
+      header: "Created At",
+      id: "createdAt",
+      enableHiding: true,
     },
     {
       accessorKey: "input",
       header: "Input",
+      id: "input",
+      enableHiding: true,
+      cell: ({ row }) => {
+        const input = row.getValue("input") as RowData["input"];
+        return input !== null ? (
+          <IOTableCell data={input} singleLine={rowHeight === "s"} />
+        ) : null;
+      },
     },
     {
       accessorKey: "expectedOutput",
       header: "Expected Output",
+      id: "expectedOutput",
+      enableHiding: true,
+      cell: ({ row }) => {
+        const expectedOutput = row.getValue(
+          "expectedOutput",
+        ) as RowData["expectedOutput"];
+        return expectedOutput !== null ? (
+          <IOTableCell
+            data={expectedOutput}
+            className="bg-accent-light-green"
+            singleLine={rowHeight === "s"}
+          />
+        ) : null;
+      },
+    },
+    {
+      accessorKey: "metadata",
+      header: "Metadata",
+      id: "metadata",
+      enableHiding: true,
+      cell: ({ row }) => {
+        const metadata = row.getValue("metadata") as RowData["metadata"];
+        return metadata !== null ? (
+          <IOTableCell data={metadata} singleLine={rowHeight === "s"} />
+        ) : null;
+      },
     },
     {
       id: "actions",
@@ -121,14 +202,20 @@ export function DatasetItemsTable({
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <Button variant="ghost" className="h-8 w-8 p-0">
-                <span className="sr-only">Open menu</span>
+                <span className="sr-only [position:relative]">Open menu</span>
                 <MoreVertical className="h-4 w-4" />
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end">
               <DropdownMenuLabel>Actions</DropdownMenuLabel>
               <DropdownMenuItem
-                onClick={() =>
+                onClick={() => {
+                  capture("dataset_item:archive_toggle", {
+                    status:
+                      status === DatasetStatus.ARCHIVED
+                        ? "unarchived"
+                        : "archived",
+                  });
                   mutUpdate.mutate({
                     projectId: projectId,
                     datasetId: datasetId,
@@ -137,8 +224,8 @@ export function DatasetItemsTable({
                       status === DatasetStatus.ARCHIVED
                         ? DatasetStatus.ACTIVE
                         : DatasetStatus.ARCHIVED,
-                  })
-                }
+                  });
+                }}
               >
                 <Archive className="mr-2 h-4 w-4" />
                 {status === DatasetStatus.ARCHIVED ? "Unarchive" : "Archive"}
@@ -153,27 +240,37 @@ export function DatasetItemsTable({
   const convertToTableRow = (
     item: RouterOutput["datasets"]["itemsByDatasetId"]["datasetItems"][number],
   ): RowData => {
-    let input = item.input ? JSON.stringify(item.input) : "";
-    input = input.length > 50 ? input.slice(0, 50) + "..." : input;
-    let expectedOutput = item.expectedOutput
-      ? JSON.stringify(item.expectedOutput)
-      : "";
-    expectedOutput =
-      expectedOutput.length > 50
-        ? expectedOutput.slice(0, 50) + "..."
-        : expectedOutput;
-
     return {
       id: item.id,
+      source: item.sourceTraceId
+        ? {
+            traceId: item.sourceTraceId,
+            observationId: item.sourceObservationId ?? undefined,
+          }
+        : undefined,
       status: item.status,
       createdAt: item.createdAt.toLocaleString(),
-      input,
-      expectedOutput,
+      input: item.input,
+      expectedOutput: item.expectedOutput,
+      metadata: item.metadata,
     };
   };
 
+  const [columnVisibility, setColumnVisibility] = useColumnVisibility<RowData>(
+    "datasetItemsColumnVisibility",
+    columns,
+  );
+
   return (
-    <div>
+    <>
+      <DataTableToolbar
+        columns={columns}
+        columnVisibility={columnVisibility}
+        setColumnVisibility={setColumnVisibility}
+        rowHeight={rowHeight}
+        setRowHeight={setRowHeight}
+        actionButtons={menuItems}
+      />
       <DataTable
         columns={columns}
         data={
@@ -200,7 +297,10 @@ export function DatasetItemsTable({
           onChange: setPaginationState,
           state: paginationState,
         }}
+        columnVisibility={columnVisibility}
+        onColumnVisibilityChange={setColumnVisibility}
+        rowHeight={rowHeight}
       />
-    </div>
+    </>
   );
 }

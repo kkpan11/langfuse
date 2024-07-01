@@ -1,17 +1,18 @@
-FROM node:20-alpine AS alpine
+FROM --platform=${BUILDPLATFORM:-linux/amd64} node:20-alpine3.20 AS alpine
 
 # It's important to update the index before installing packages to ensure you're getting the latest versions.
 # Check https://github.com/nodejs/docker-node/tree/b4117f9333da4138b03a546ec926ef50a31506c3#nodealpine to understand why libc6-compat might be needed.
-RUN apk update && apk upgrade --no-cache libcrypto3 libssl3 libc6-compat
+RUN apk update && apk upgrade --no-cache libcrypto3 libssl3 libc6-compat busybox ssl_client
 
-FROM alpine AS base
-RUN npm install pnpm turbo --global
+FROM --platform=${BUILDPLATFORM:-linux/amd64} alpine AS base
+RUN npm install turbo@^1.13.3 --global
 ENV PNPM_HOME="/pnpm"
 ENV PATH="$PNPM_HOME:$PATH"
 RUN corepack enable
+RUN corepack prepare pnpm@8.15.5 --activate
 
 
-FROM base AS pruner
+FROM --platform=${BUILDPLATFORM:-linux/amd64} base AS pruner
 
 WORKDIR /app
 
@@ -19,7 +20,7 @@ COPY . .
 RUN turbo prune --scope=web --docker
 
 
-FROM base AS builder
+FROM --platform=${BUILDPLATFORM:-linux/amd64} base AS builder
 
 WORKDIR /app
 
@@ -32,6 +33,15 @@ RUN pnpm install --frozen-lockfile
 
 ENV DOCKER_BUILD 1
 
+# pass public variables in build step
+ARG NEXT_PUBLIC_LANGFUSE_CLOUD_REGION
+ARG NEXT_PUBLIC_DEMO_PROJECT_ID
+ARG NEXT_PUBLIC_SIGN_UP_DISABLED
+ARG NEXT_PUBLIC_TURNSTILE_SITE_KEY
+ARG NEXT_PUBLIC_POSTHOG_KEY
+ARG NEXT_PUBLIC_POSTHOG_HOST
+ARG NEXT_PUBLIC_CRISP_WEBSITE_ID
+ARG LANFUSE_WEB_MIGRATION_DISABLED
 
 # Copy source code of isolated subworkspace
 COPY --from=pruner /app/out/full/ .
@@ -47,7 +57,7 @@ ENV NEXT_TELEMETRY_DISABLED 1
 RUN turbo run build --filter=web
 
 # Production image, copy all the files and run next
-FROM base AS runner
+FROM --platform=${TARGETPLATFORM:-linux/amd64} base AS runner
 
 RUN apk add --no-cache dumb-init
 
@@ -77,6 +87,7 @@ COPY --from=builder --chown=nextjs:nodejs /app/web/public ./web/public
 COPY --from=builder --chown=nextjs:nodejs /app/packages/shared/prisma ./packages/shared/prisma
 
 COPY --chown=nextjs:nodejs ./web/entrypoint.sh ./web/entrypoint.sh
+COPY --chown=nextjs:nodejs ./packages/shared/scripts/cleanup.sql ./packages/shared/scripts/cleanup.sql
 RUN chmod +x ./web/entrypoint.sh
 
 USER nextjs

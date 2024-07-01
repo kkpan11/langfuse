@@ -11,6 +11,7 @@ import {
   PenSquareIcon,
   LibraryBig,
   TerminalIcon,
+  Lightbulb,
 } from "lucide-react";
 
 export type Route = {
@@ -23,6 +24,7 @@ export type Route = {
   children?: Array<Route>; // folder
   bottom?: boolean; // bottom of the sidebar, only for first level routes
   newTab?: boolean; // open in new tab
+  requires?: "cloud" | "cloud-or-ee"; // feature requires cloud or ee
 };
 
 export const ROUTES: Route[] = [
@@ -55,15 +57,31 @@ export const ROUTES: Route[] = [
         name: "Models",
         pathname: `/project/[projectId]/models`,
       },
+    ],
+  },
+  {
+    name: "Evaluation",
+    icon: Lightbulb,
+    requires: "cloud",
+    label: "Beta",
+    children: [
       {
         name: "Templates",
         pathname: `/project/[projectId]/evals/templates`,
-        featureFlag: "evals",
+        requires: "cloud",
+        rbacScope: "evalTemplate:read",
       },
       {
         name: "Configs",
         pathname: `/project/[projectId]/evals/configs`,
-        featureFlag: "evals",
+        requires: "cloud",
+        rbacScope: "evalJob:read",
+      },
+      {
+        name: "Log",
+        pathname: `/project/[projectId]/evals/log`,
+        requires: "cloud",
+        rbacScope: "evalJobExecution:read",
       },
     ],
   },
@@ -82,7 +100,8 @@ export const ROUTES: Route[] = [
     name: "Playground",
     pathname: "/project/[projectId]/playground",
     icon: TerminalIcon,
-    featureFlag: "playground",
+    requires: "cloud-or-ee",
+    label: "Beta",
   },
   {
     name: "Datasets",

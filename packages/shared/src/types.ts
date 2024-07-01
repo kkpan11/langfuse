@@ -29,4 +29,6 @@ export type TableName =
   | "generations"
   | "sessions"
   | "scores"
-  | "dashboard";
+  | "prompts"
+  | "dashboard"
+  | "users";

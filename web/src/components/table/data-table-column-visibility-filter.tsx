@@ -12,8 +12,9 @@ import {
   DropdownMenuCheckboxItem,
 } from "@/src/components/ui/dropdown-menu";
 import { type VisibilityState } from "@tanstack/react-table";
-import { ChevronDownIcon } from "lucide-react";
+import { ChevronDown, Columns } from "lucide-react";
 import { type LangfuseColumnDef } from "@/src/components/table/types";
+import { usePostHogClientCapture } from "@/src/features/posthog-analytics/usePostHogClientCapture";
 
 interface DataTableColumnVisibilityFilterProps<TData, TValue> {
   columns: LangfuseColumnDef<TData, TValue>[];
@@ -27,14 +28,24 @@ export function DataTableColumnVisibilityFilter<TData, TValue>({
   setColumnVisibility,
 }: DataTableColumnVisibilityFilterProps<TData, TValue>) {
   const [isOpen, setIsOpen] = useState(false);
-
+  const capture = usePostHogClientCapture();
   const toggleColumn = useCallback(
     (columnId: string) => {
-      setColumnVisibility((old) => ({
-        ...old,
-        [columnId]: !old[columnId],
-      }));
+      setColumnVisibility((old) => {
+        const newColumnVisibility = {
+          ...old,
+          [columnId]: !old[columnId],
+        };
+        const selectedColumns = Object.keys(newColumnVisibility).filter(
+          (key) => newColumnVisibility[key],
+        );
+        capture("table:column_visibility_changed", {
+          selectedColumns: selectedColumns,
+        });
+        return newColumnVisibility;
+      });
     },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     [setColumnVisibility],
   );
 
@@ -70,14 +81,16 @@ export function DataTableColumnVisibilityFilter<TData, TValue>({
         className="select-none"
         asChild
       >
-        <Button variant="outline" className="ml-auto">
-          Columns {count <= total ? `${count}/${total}` : ""}
-          <ChevronDownIcon className="ml-2 h-4 w-4" />
+        <Button variant="outline" title="Show/hide columns">
+          <Columns className="mr-2 h-4 w-4" />
+          <span className="text-xs text-muted-foreground">{`(${count}/${total})`}</span>
+          <ChevronDown className="ml-2 h-4 w-4" />
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent
         align="end"
         onPointerDownOutside={() => setIsOpen(false)}
+        className="max-h-96 overflow-y-auto"
       >
         {columns.map(
           (column, index) =>

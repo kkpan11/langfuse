@@ -1,17 +1,18 @@
-FROM node:20-alpine AS alpine
+FROM --platform=${BUILDPLATFORM:-linux/amd64} node:20-alpine3.20 AS alpine
 
 # It's important to update the index before installing packages to ensure you're getting the latest versions.
 # Check https://github.com/nodejs/docker-node/tree/b4117f9333da4138b03a546ec926ef50a31506c3#nodealpine to understand why libc6-compat might be needed.
-RUN apk update && apk upgrade --no-cache libcrypto3 libssl3 libc6-compat
+RUN apk update && apk upgrade --no-cache libcrypto3 libssl3 libc6-compat busybox ssl_client
 
-FROM alpine AS base
-RUN npm install pnpm turbo --global
+FROM --platform=${BUILDPLATFORM:-linux/amd64} alpine AS base
+RUN npm install turbo@^1.13.3 --global
 ENV PNPM_HOME="/pnpm"
 ENV PATH="$PNPM_HOME:$PATH"
 RUN corepack enable
+RUN corepack prepare pnpm@8.15.5 --activate
 
 
-FROM base AS pruner
+FROM --platform=${BUILDPLATFORM:-linux/amd64} base AS pruner
 
 WORKDIR /app
 
@@ -20,7 +21,7 @@ RUN turbo prune --scope=worker --docker
 
 
 
-FROM base AS builder
+FROM --platform=${BUILDPLATFORM:-linux/amd64} base AS builder
 
 WORKDIR /app
 
@@ -31,6 +32,11 @@ COPY --from=pruner /app/out/json/ .
 
 RUN pnpm install --frozen-lockfile
 
+# pass public variables in build step
+ARG NEXT_PUBLIC_LANGFUSE_CLOUD_REGION
+ARG NEXT_PUBLIC_DEMO_PROJECT_ID
+ARG NEXT_PUBLIC_POSTHOG_KEY
+ARG NEXT_PUBLIC_POSTHOG_HOST
 
 # Copy source code of isolated subworkspace
 COPY --from=pruner /app/out/full/ .
@@ -39,7 +45,7 @@ RUN turbo run build --filter=worker...
 
 
 
-FROM base AS runner
+FROM --platform=${TARGETPLATFORM:-linux/amd64} base AS runner
 
 WORKDIR /app
 
@@ -55,4 +61,4 @@ COPY --from=builder --chown=expressjs:expressjs /app .
 EXPOSE 3030
 ENV PORT=3030
 
-CMD ["node", "worker/dist/src/index.js"]
+CMD ["node", "worker/dist/index.js"]

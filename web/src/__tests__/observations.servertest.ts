@@ -5,7 +5,7 @@ import { v4 as uuidv4 } from "uuid";
 import { makeAPICall, pruneDatabase } from "@/src/__tests__/test-utils";
 import { ModelUsageUnit } from "@langfuse/shared";
 import { prisma } from "@langfuse/shared/src/db";
-import { type ObservationView } from "@langfuse/shared/src/db";
+import { type ObservationView } from "@langfuse/shared";
 
 describe("/api/public/observations API Endpoint", () => {
   beforeEach(async () => await pruneDatabase());
@@ -75,9 +75,7 @@ describe("/api/public/observations API Endpoint", () => {
         },
         internalModel: "gpt-3.5-turbo",
         unit: ModelUsageUnit.Tokens,
-        prompt: {
-          connect: { id: prompt.id },
-        },
+        promptId: prompt.id,
       },
     });
 

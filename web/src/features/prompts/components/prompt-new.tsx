@@ -11,10 +11,10 @@ export const NewPrompt = () => {
 
   const { data: initialPrompt, isInitialLoading } = api.prompts.byId.useQuery(
     {
-      projectId,
+      projectId: projectId as string, // Typecast as query is enabled only when projectId is present
       id: initialPromptId ?? "",
     },
-    { enabled: Boolean(initialPromptId) },
+    { enabled: Boolean(initialPromptId && projectId) },
   );
 
   if (isInitialLoading) {
@@ -58,7 +58,7 @@ export const NewPrompt = () => {
         breadcrumb={breadcrumb}
       />
       {initialPrompt ? (
-        <p className="text-sm text-gray-500">
+        <p className="text-sm text-muted-foreground">
           Prompts are immutable in Langfuse. To update a prompt, create a new
           version.
         </p>

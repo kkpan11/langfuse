@@ -1,16 +1,16 @@
-import { prisma } from "@langfuse/shared/src/db";
+import { ScoreSource, prisma } from "@langfuse/shared/src/db";
 import { Prisma, type Score } from "@langfuse/shared/src/db";
 import { type NextApiRequest, type NextApiResponse } from "next";
 import { z } from "zod";
 import { cors, runMiddleware } from "@/src/features/public-api/server/cors";
 import { verifyAuthHeaderAndReturnScope } from "@/src/features/public-api/server/apiAuth";
-import { paginationZod } from "@/src/utils/zod";
+import { paginationZod } from "@langfuse/shared";
 import {
   ScoreBody,
   eventTypes,
   ingestionBatchEvent,
   stringDate,
-} from "@/src/features/public-api/server/ingestion-api-schema";
+} from "@langfuse/shared";
 import { v4 } from "uuid";
 import {
   handleBatch,
@@ -18,12 +18,26 @@ import {
 } from "@/src/pages/api/public/ingestion";
 import { isPrismaException } from "@/src/utils/exceptions";
 
-const ScoresGetSchema = z.object({
-  ...paginationZod,
-  userId: z.string().nullish(),
-  name: z.string().nullish(),
-  fromTimestamp: stringDate,
-});
+const operators = ["<", ">", "<=", ">=", "!=", "="] as const;
+
+const ScoresGetSchema = z
+  .object({
+    ...paginationZod,
+    userId: z.string().nullish(),
+    name: z.string().nullish(),
+    fromTimestamp: stringDate,
+    source: z.nativeEnum(ScoreSource).nullish(),
+    value: z.coerce.number().nullish(),
+    operator: z.enum(operators).nullish(),
+    scoreIds: z
+      .string()
+      .transform((str) => str.split(",").map((id) => id.trim())) // Split the comma-separated string
+      .refine((arr) => arr.every((id) => typeof id === "string"), {
+        message: "Each score ID must be a string",
+      })
+      .nullish(),
+  })
+  .strict(); // Use strict to give 400s on typo'd query params
 
 export default async function handler(
   req: NextApiRequest,
@@ -103,7 +117,17 @@ export default async function handler(
         ? Prisma.sql`AND s."name" = ${obj.name}`
         : Prisma.empty;
       const fromTimestampCondition = obj.fromTimestamp
-        ? Prisma.sql`AND t."timestamp" >= ${obj.fromTimestamp}::timestamp with time zone at time zone 'UTC'`
+        ? Prisma.sql`AND s."timestamp" >= ${obj.fromTimestamp}::timestamp with time zone at time zone 'UTC'`
+        : Prisma.empty;
+      const sourceCondition = obj.source
+        ? Prisma.sql`AND s."source" = ${obj.source}`
+        : Prisma.empty;
+      const valueCondition =
+        obj.operator && obj.value !== null && obj.value !== undefined
+          ? Prisma.sql`AND s."value" ${Prisma.raw(`${obj.operator}`)} ${obj.value}`
+          : Prisma.empty;
+      const scoreIdCondition = obj.scoreIds
+        ? Prisma.sql`AND s."id" = ANY(${obj.scoreIds})`
         : Prisma.empty;
 
       const scores = await prisma.$queryRaw<
@@ -114,31 +138,41 @@ export default async function handler(
             s.timestamp,
             s.name,
             s.value,
+            s.source,
             s.comment,
             s.trace_id as "traceId",
             s.observation_id as "observationId",
             json_build_object('userId', t.user_id) as "trace"
           FROM "scores" AS s
-          JOIN "traces" AS t ON t.id = s.trace_id
-          WHERE t.project_id = ${authCheck.scope.projectId}
+          LEFT JOIN "traces" AS t ON t.id = s.trace_id AND t.project_id = ${authCheck.scope.projectId}
+          WHERE s.project_id = ${authCheck.scope.projectId}
           ${userCondition}
           ${nameCondition}
+          ${sourceCondition}
           ${fromTimestampCondition}
-          ORDER BY t."timestamp" DESC
+          ${valueCondition}
+          ${scoreIdCondition}
+          ORDER BY s."timestamp" DESC
           LIMIT ${obj.limit} OFFSET ${skipValue}
           `);
-      const totalItems = await prisma.score.count({
-        where: {
-          name: obj.name ? obj.name : undefined,
-          timestamp: obj.fromTimestamp
-            ? { gte: new Date(obj.fromTimestamp) }
-            : undefined,
-          trace: {
-            projectId: authCheck.scope.projectId,
-            userId: obj.userId ? obj.userId : undefined,
-          },
-        },
-      });
+
+      const totalItemsRes = await prisma.$queryRaw<{ count: bigint }[]>(
+        Prisma.sql`
+          SELECT COUNT(*) as count
+          FROM "scores" AS s
+          LEFT JOIN "traces" AS t ON t.id = s.trace_id AND t.project_id = ${authCheck.scope.projectId}
+          WHERE s.project_id = ${authCheck.scope.projectId}
+          ${userCondition}
+          ${nameCondition}
+          ${sourceCondition}
+          ${fromTimestampCondition}
+          ${valueCondition}
+          ${scoreIdCondition}
+        `,
+      );
+
+      const totalItems =
+        totalItemsRes[0] !== undefined ? Number(totalItemsRes[0].count) : 0;
 
       return res.status(200).json({
         data: scores,

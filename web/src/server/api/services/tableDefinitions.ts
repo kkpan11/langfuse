@@ -80,7 +80,7 @@ export const scoreId = {
   internal: 's."id"',
 } as const;
 export const traceName = {
-  name: "traceName",
+  name: "Trace Name",
   id: "traceName",
   type: "string",
   internal: 't."name"',
@@ -111,6 +111,13 @@ export const calculatedTotalCost = {
   internal: 'o."calculated_total_cost"',
 } as const;
 
+export const traceTags = {
+  name: "Tags",
+  id: "tags",
+  type: "string",
+  internal: 't."tags"',
+} as const;
+
 const tracesObservationsColumns: ColumnDefinition[] = [
   traceId,
   observationId,
@@ -125,6 +132,7 @@ const tracesObservationsColumns: ColumnDefinition[] = [
   startTime,
   traceName,
   observationName,
+  traceTags,
 ];
 
 const tracesColumns = [
@@ -135,6 +143,7 @@ const tracesColumns = [
   traceTimestamp,
   traceName,
   traceUser,
+  traceTags,
 ];
 
 export const tableDefinitions: TableDefinitions = {
@@ -191,7 +200,7 @@ export const tableDefinitions: TableDefinitions = {
     ],
   },
   traces_scores: {
-    table: ` traces t JOIN scores s ON t.id = s.trace_id`,
+    table: ` traces t JOIN scores s ON t.id = s.trace_id AND s.data_type != 'CATEGORICAL' AND t.project_id = s.project_id`,
     columns: [
       tracesProjectId,
       { name: "value", id: "value", type: "number", internal: 's."value"' },
@@ -208,11 +217,12 @@ export const tableDefinitions: TableDefinitions = {
       traceUser,
       tracesProjectId,
       traceName,
+      traceTags,
     ],
   },
 
   traces_parent_observation_scores: {
-    table: ` traces t LEFT JOIN observations_view o on t."id" = o."trace_id" and o."parent_observation_id" is NULL LEFT JOIN scores s ON t."id" = s."trace_id"`,
+    table: ` traces t LEFT JOIN observations_view o on t."id" = o."trace_id" and o."parent_observation_id" is NULL AND t.project_id = o.project_id LEFT JOIN scores s ON t."id" = s."trace_id" AND t.project_id = s.project_id`,
     columns: [
       {
         name: "projectId",
@@ -234,6 +244,7 @@ export const tableDefinitions: TableDefinitions = {
       release,
       tracesProjectId,
       observationsProjectId,
+      traceTags,
     ],
   },
 };

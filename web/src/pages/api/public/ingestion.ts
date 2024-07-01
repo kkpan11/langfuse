@@ -10,7 +10,10 @@ import {
   type ingestionApiSchema,
   eventTypes,
   ingestionEvent,
-} from "@/src/features/public-api/server/ingestion-api-schema";
+  type TraceUpsertEventType,
+  type EventBodyType,
+  EventName,
+} from "@langfuse/shared";
 import { type ApiAccessScope } from "@/src/features/public-api/server/types";
 import { persistEventMiddleware } from "@/src/server/api/services/event-service";
 import { backOff } from "exponential-backoff";
@@ -24,17 +27,17 @@ import { ObservationProcessor } from "../../../server/api/services/EventProcesso
 import { ScoreProcessor } from "../../../server/api/services/EventProcessor";
 import { isNotNullOrUndefined } from "@/src/utils/types";
 import { telemetry } from "@/src/features/telemetry";
-import { jsonSchema } from "@/src/utils/zod";
+import { jsonSchema } from "@langfuse/shared";
 import * as Sentry from "@sentry/nextjs";
 import { isPrismaException } from "@/src/utils/exceptions";
 import { env } from "@/src/env.mjs";
 import {
-  ValidationError,
+  InvalidRequestError,
   MethodNotAllowedError,
   BaseError,
   ForbiddenError,
   UnauthorizedError,
-} from "@/src/server/errors";
+} from "@langfuse/shared";
 
 export const config = {
   api: {
@@ -73,6 +76,11 @@ export default async function handler(
 
     const parsedSchema = batchType.safeParse(req.body);
 
+    Sentry.metrics.increment(
+      "ingestion_event",
+      parsedSchema.success ? parsedSchema.data.batch.length : 0,
+    );
+
     if (!parsedSchema.success) {
       console.log("Invalid request data", parsedSchema.error);
       return res.status(400).json({
@@ -94,7 +102,7 @@ export default async function handler(
                   ? event.id
                   : "unknown"
                 : "unknown",
-            error: new ValidationError(parsed.error.message),
+            error: new InvalidRequestError(parsed.error.message),
           });
           return undefined;
         } else {
@@ -126,7 +134,11 @@ export default async function handler(
       res,
     );
   } catch (error: unknown) {
-    console.error(error);
+    console.error("error handling ingestion event", error);
+
+    if (!(error instanceof UnauthorizedError)) {
+      Sentry.captureException(error);
+    }
 
     if (error instanceof BaseError) {
       return res.status(error.httpCode).json({
@@ -141,6 +153,7 @@ export default async function handler(
       });
     }
     if (error instanceof z.ZodError) {
+      console.log(`Zod exception`, error.errors);
       return res.status(400).json({
         message: "Invalid request data",
         error: error.errors,
@@ -156,17 +169,26 @@ export default async function handler(
   }
 }
 
-const sortBatch = (batch: Array<z.infer<typeof ingestionEvent>>) => {
-  // keep the order of events as they are. Order events in a way that types containing updates come last
-  // Filter out OBSERVATION_UPDATE events
-  const updates = batch.filter(
-    (event) => event.type === eventTypes.OBSERVATION_UPDATE,
-  );
+/**
+ * Sorts a batch of ingestion events. Orders by: updating events last, sorted by timestamp asc.
+ */
 
-  // Keep all other events in their original order
-  const others = batch.filter(
-    (event) => event.type !== eventTypes.OBSERVATION_UPDATE,
-  );
+const sortBatch = (batch: Array<z.infer<typeof ingestionEvent>>) => {
+  const updateEvents: (typeof eventTypes)[keyof typeof eventTypes][] = [
+    eventTypes.GENERATION_UPDATE,
+    eventTypes.SPAN_UPDATE,
+    eventTypes.OBSERVATION_UPDATE, // legacy event type
+  ];
+  const updates = batch
+    .filter((event) => updateEvents.includes(event.type))
+    .sort((a, b) => {
+      return new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime();
+    });
+  const others = batch
+    .filter((event) => !updateEvents.includes(event.type))
+    .sort((a, b) => {
+      return new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime();
+    });
 
   // Return the array with non-update events first, followed by update events
   return [...others, ...updates];
@@ -178,7 +200,7 @@ export const handleBatch = async (
   req: NextApiRequest,
   authCheck: AuthHeaderVerificationResult,
 ) => {
-  console.log("handling ingestion event", JSON.stringify(events, null, 2));
+  console.log(`handling ingestion ${events.length} events`);
 
   if (!authCheck.validKey) throw new UnauthorizedError(authCheck.error);
 
@@ -230,9 +252,12 @@ async function retry<T>(request: () => Promise<T>): Promise<T> {
     },
   });
 }
-export const getBadRequestError = (errors: Array<unknown>): ValidationError[] =>
+export const getBadRequestError = (
+  errors: Array<unknown>,
+): InvalidRequestError[] =>
   errors.filter(
-    (error): error is ValidationError => error instanceof ValidationError,
+    (error): error is InvalidRequestError =>
+      error instanceof InvalidRequestError,
   );
 
 export const getResourceNotFoundError = (
@@ -244,7 +269,7 @@ export const getResourceNotFoundError = (
   );
 
 export const hasBadRequestError = (errors: Array<unknown>) =>
-  errors.some((error) => error instanceof ValidationError);
+  errors.some((error) => error instanceof InvalidRequestError);
 
 const handleSingleEvent = async (
   event: z.infer<typeof ingestionEvent>,
@@ -252,9 +277,20 @@ const handleSingleEvent = async (
   req: NextApiRequest,
   apiScope: ApiAccessScope,
 ) => {
+  const { body } = event;
+  let restEvent = body;
+  if ("input" in body) {
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    const { input, ...rest } = body;
+    restEvent = rest;
+  }
+  if ("output" in restEvent) {
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    const { output, ...rest } = restEvent;
+    restEvent = rest;
+  }
   console.log(
-    `handling single event ${event.id}`,
-    JSON.stringify(event, null, 2),
+    `handling single event ${event.id} of type ${event.type}:  ${JSON.stringify({ body: restEvent })}`,
   );
 
   const cleanedEvent = ingestionEvent.parse(cleanEvent(event));
@@ -318,7 +354,7 @@ export const handleBatchResult = (
   }[] = [];
 
   errors.forEach((error) => {
-    if (error.error instanceof ValidationError) {
+    if (error.error instanceof InvalidRequestError) {
       returnedErrors.push({
         id: error.id,
         status: 400,
@@ -424,31 +460,42 @@ export const sendToWorkerIfEnvironmentConfigured = async (
   projectId: string,
 ): Promise<void> => {
   try {
-    if (env.LANGFUSE_WORKER_HOST && env.LANGFUSE_WORKER_PASSWORD) {
-      const traceEvents = batchResults
+    if (
+      env.LANGFUSE_WORKER_HOST &&
+      env.LANGFUSE_WORKER_PASSWORD &&
+      env.NEXT_PUBLIC_LANGFUSE_CLOUD_REGION
+    ) {
+      const traceEvents: TraceUpsertEventType[] = batchResults
         .filter((result) => result.type === eventTypes.TRACE_CREATE) // we only have create, no update.
         .map((result) =>
           result.result &&
           typeof result.result === "object" &&
           "id" in result.result
             ? // ingestion API only gets traces for one projectId
-              { traceId: result.result.id, projectId: projectId }
+              { traceId: result.result.id as string, projectId }
             : null,
         )
         .filter(isNotNullOrUndefined);
 
-      await fetch(`${env.LANGFUSE_WORKER_HOST}/api/events`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization:
-            "Basic " +
-            Buffer.from("admin" + ":" + env.LANGFUSE_WORKER_PASSWORD).toString(
-              "base64",
-            ),
-        },
-        body: JSON.stringify(traceEvents),
-      });
+      const body: EventBodyType = {
+        name: EventName.TraceUpsert,
+        payload: traceEvents,
+      };
+
+      if (traceEvents.length > 0) {
+        await fetch(`${env.LANGFUSE_WORKER_HOST}/api/events`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization:
+              "Basic " +
+              Buffer.from(
+                "admin" + ":" + env.LANGFUSE_WORKER_PASSWORD,
+              ).toString("base64"),
+          },
+          body: JSON.stringify(body),
+        });
+      }
     }
   } catch (error) {
     console.error("Error sending events to worker", error);

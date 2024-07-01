@@ -111,7 +111,24 @@ types:
       totalCost:
         docs: USD total cost, defaults to input+output
         type: optional<double>
-
+  ScoreConfig:
+    docs: Configuration for a score
+    properties:
+      id: string
+      name: string
+      createdAt: datetime
+      updatedAt: datetime
+      projectId: string
+      dataType: ScoreDataType
+      isArchived: boolean
+      minValue: optional<double>
+      maxValue: optional<double>
+      categories: optional<list<ConfigCategory>>
+      description: optional<string>
+  ConfigCategory:
+    properties:
+      value: double
+      label: string
   Score:
     properties:
       id: string
@@ -122,44 +139,33 @@ types:
       observationId: optional<string>
       timestamp: datetime
       comment: optional<string>
-  DatasetCore:
+  Dataset:
     properties:
       id: string
       name: string
       description: optional<string>
+      metadata: optional<unknown>
       projectId: string
       createdAt: datetime
       updatedAt: datetime
-  DatasetWithReferences: # GET datasets
-    extends: DatasetCore
-    properties:
-      items:
-        type: list<string>
-        docs: list of dataset item ids
-      runs:
-        type: list<string>
-        docs: list of dataset run names
-  Dataset: # GET datasets/[name]
-    docs: Dataset including all items
-    extends: DatasetCore
-    properties:
-      items: list<DatasetItem>
-      runs: list<string>
   DatasetItem:
     properties:
       id: string
       status: DatasetStatus
       input: optional<unknown>
       expectedOutput: optional<unknown>
+      metadata: optional<unknown>
       sourceTraceId: optional<string>
       sourceObservationId: optional<string>
       datasetId: string
+      datasetName: string
       createdAt: datetime
       updatedAt: datetime
   DatasetRunItem:
     properties:
       id: string
       datasetRunId: string
+      datasetRunName: string
       datasetItemId: string
       traceId: string
       observationId: optional<string>
@@ -175,6 +181,9 @@ types:
       datasetName: string
       createdAt: datetime
       updatedAt: datetime
+  DatasetRunWithItems:
+    extends: DatasetRun
+    properties:
       datasetRunItems: list<DatasetRunItem>
 
   # Utilities
@@ -205,8 +214,14 @@ types:
       - ARCHIVED
   ScoreSource:
     enum:
+      - ANNOTATION
       - API
-      - REVIEW
+      - EVAL
+  ScoreDataType:
+    enum:
+      - NUMERIC
+      - BOOLEAN
+      - CATEGORICAL
 
 errors:
   Error:

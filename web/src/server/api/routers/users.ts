@@ -4,11 +4,17 @@ import {
   createTRPCRouter,
   protectedProjectProcedure,
 } from "@/src/server/api/trpc";
+import { paginationZod } from "@langfuse/shared";
+import {
+  singleFilter,
+  tableColumnsToSqlFilterAndPrefix,
+} from "@langfuse/shared";
 import { Prisma, type Score } from "@langfuse/shared/src/db";
-import { paginationZod } from "@/src/utils/zod";
+import { usersTableCols } from "@/src/server/api/definitions/usersTable";
 
 const UserFilterOptions = z.object({
   projectId: z.string(), // Required for protectedProjectProcedure
+  filter: z.array(singleFilter).nullable(),
 });
 
 const UserAllOptions = UserFilterOptions.extend({
@@ -19,17 +25,26 @@ export const userRouter = createTRPCRouter({
   all: protectedProjectProcedure
     .input(UserAllOptions)
     .query(async ({ input, ctx }) => {
-      const uniqueUsers = await ctx.prisma.trace.findMany({
-        where: {
-          projectId: input.projectId,
-        },
-        select: {
-          userId: true,
-        },
-        distinct: ["userId"],
-      });
+      const filterCondition = tableColumnsToSqlFilterAndPrefix(
+        input.filter ?? [],
+        usersTableCols,
+        "users",
+      );
 
-      const topUsers = await ctx.prisma.$queryRaw<
+      const totalUsers = (
+        await ctx.prisma.$queryRaw<
+          Array<{
+            totalCount: number;
+          }>
+        >`
+        SELECT COUNT(DISTINCT t.user_id)::int AS "totalCount"
+        FROM traces t
+        WHERE t.project_id = ${input.projectId}
+        ${filterCondition}
+      `
+      )[0].totalCount;
+
+      const users = await ctx.prisma.$queryRaw<
         Array<{
           userId: string;
           totalTraces: number;
@@ -44,6 +59,7 @@ export const userRouter = createTRPCRouter({
           t.user_id IS NOT NULL
           AND t.user_id != ''
           AND t.project_id = ${input.projectId}
+          ${filterCondition}
         GROUP BY
           t.user_id
         ORDER BY
@@ -52,8 +68,8 @@ export const userRouter = createTRPCRouter({
           ${input.limit} OFFSET ${input.page * input.limit};
       `;
       return {
-        totalUsers: uniqueUsers.length,
-        users: topUsers,
+        totalUsers,
+        users,
       };
     }),
 
@@ -153,6 +169,7 @@ export const userRouter = createTRPCRouter({
             JOIN traces t ON t.id = s.trace_id
           WHERE
             s.trace_id IS NOT NULL
+            AND s.project_id = ${input.projectId}
             AND t.project_id = ${input.projectId}
             AND t.user_id IN (${Prisma.join(users.map((user) => user.userId))})
             AND t.user_id IS NOT NULL
@@ -249,6 +266,7 @@ export const userRouter = createTRPCRouter({
             JOIN traces t ON t.id = s.trace_id
           WHERE
             s.trace_id IS NOT NULL
+            AND s.project_id = ${input.projectId}
             AND t.project_id = ${input.projectId}
             AND t.user_id = ${input.userId}
             AND t.user_id IS NOT NULL
