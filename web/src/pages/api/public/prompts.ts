@@ -1,98 +1,71 @@
-import { createPrompt } from "@/src/features/prompts/server/createPrompt";
-import { verifyAuthHeaderAndReturnScope } from "@/src/features/public-api/server/apiAuth";
-import { cors, runMiddleware } from "@/src/features/public-api/server/cors";
-import { prisma } from "@langfuse/shared/src/db";
-import { isPrismaException } from "@/src/utils/exceptions";
-import { type NextApiRequest, type NextApiResponse } from "next";
 import { z } from "zod";
+
+import { getPromptByName } from "@/src/features/prompts/server/actions/getPromptByName";
+import { createPromptForApi } from "@/src/features/prompts/server/prompt-api-service";
+import { createAuthedProjectAPIRoute } from "@/src/features/public-api/server/createAuthedProjectAPIRoute";
+import { withMiddlewares } from "@/src/features/public-api/server/withMiddlewares";
+import { telemetry } from "@/src/features/telemetry";
 import {
-  CreatePromptSchema,
   GetPromptSchema,
-} from "@/src/features/prompts/server/validation";
-import {
-  UnauthorizedError,
-  NotFoundError,
-  BaseError,
-  MethodNotAllowedError,
-  ForbiddenError,
-} from "@/src/server/errors";
+  LangfuseNotFoundError,
+  LegacyCreatePromptSchema,
+  PRODUCTION_LABEL,
+} from "@langfuse/shared";
 
-export default async function handler(
-  req: NextApiRequest,
-  res: NextApiResponse,
-) {
-  await runMiddleware(req, res, cors);
+export default withMiddlewares({
+  GET: createAuthedProjectAPIRoute({
+    name: "Get Prompt (Legacy)",
+    action: "prompts:read",
+    querySchema: GetPromptSchema,
+    responseSchema: z.any(),
+    allowInAppAgentKey: false,
+    isAdminApiKeyAuthAllowed: false,
+    rateLimitResource: "prompts",
+    fn: async ({ query, auth }) => {
+      await telemetry();
 
-  try {
-    // Authentication and authorization
-    const authCheck = await verifyAuthHeaderAndReturnScope(
-      req.headers.authorization,
-    );
-    if (!authCheck.validKey) throw new UnauthorizedError(authCheck.error);
-    if (authCheck.scope.accessLevel !== "all")
-      throw new ForbiddenError(
-        `Access denied - need to use basic auth with secret key to ${req.method} prompts`,
-      );
+      const prompt = await getPromptByName({
+        promptName: query.name,
+        projectId: auth.scope.projectId,
+        version: query.version ?? undefined,
+      });
 
-    // Handle GET requests
-    if (req.method === "GET") {
-      const searchParams = GetPromptSchema.parse(req.query);
-      const prompt = await prisma.prompt.findFirst({
-        where: {
-          projectId: authCheck.scope.projectId,
-          name: searchParams.name,
-          version: searchParams.version ?? undefined, // if no version is given, we take the latest active prompt
-          isActive: !searchParams.version ? true : undefined, // if no prompt is active, there will be no prompt available
+      if (!prompt) throw new LangfuseNotFoundError("Prompt not found");
+
+      return {
+        ...prompt,
+        isActive: prompt.labels.includes(PRODUCTION_LABEL),
+      };
+    },
+  }),
+  POST: createAuthedProjectAPIRoute({
+    name: "Create Prompt (Legacy)",
+    action: "prompts:CUD",
+    bodySchema: LegacyCreatePromptSchema,
+    responseSchema: z.any(),
+    successStatusCode: 201,
+    allowInAppAgentKey: false,
+    isAdminApiKeyAuthAllowed: false,
+    rateLimitResource: "prompts",
+    fn: async ({ body, auth, ctx }) => {
+      await telemetry();
+
+      const { isActive, ...input } = body;
+      const prompt = await createPromptForApi({
+        context: auth.scope,
+        input: {
+          ...input,
+          labels: isActive
+            ? [...new Set([...input.labels, PRODUCTION_LABEL])]
+            : input.labels,
         },
+        ctx,
       });
 
-      if (!prompt) throw new NotFoundError("Prompt not found");
-
-      return res.status(200).json(prompt);
-    }
-
-    // Handle POST requests
-    if (req.method === "POST") {
-      const input = CreatePromptSchema.parse(req.body);
-      const prompt = await createPrompt({
-        ...input,
-        config: input.config ?? {}, // Config can be null in which case zod default value is not used
-        projectId: authCheck.scope.projectId,
-        createdBy: "API",
-        prisma: prisma,
-      });
-
-      return res.status(201).json(prompt);
-    }
-
-    throw new MethodNotAllowedError();
-  } catch (error: unknown) {
-    console.error(error);
-
-    if (error instanceof BaseError) {
-      return res.status(error.httpCode).json({
-        error: error.name,
-        message: error.message,
-      });
-    }
-
-    if (isPrismaException(error)) {
-      return res.status(500).json({
-        error: "Internal Server Error",
-      });
-    }
-
-    if (error instanceof z.ZodError) {
-      return res.status(400).json({
-        message: "Invalid request data",
-        error: error.errors,
-      });
-    }
-
-    return res.status(500).json({
-      message: "Invalid request data",
-      error:
-        error instanceof Error ? error.message : "An unknown error occurred",
-    });
-  }
-}
+      return {
+        ...prompt,
+        isActive: prompt.labels.includes(PRODUCTION_LABEL),
+      };
+    },
+  }),
+});

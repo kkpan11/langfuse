@@ -1,25 +1,46 @@
-import { VERSION } from "@/src/constants";
+import { VERSION } from "@/src/constants/VERSION";
+import { ServerPosthog } from "@/src/features/posthog-analytics/ServerPosthog";
 import { Prisma, prisma } from "@langfuse/shared/src/db";
-import { PostHog } from "posthog-node";
 import { v4 as uuidv4 } from "uuid";
+import {
+  getDatasetRunItemCountsByProjectInCreationInterval,
+  getDetectedClickHouseVersion,
+  getObservationCountsByProjectInCreationInterval,
+  getScoreCountsByProjectInCreationInterval,
+  getTraceCountsByProjectInCreationInterval,
+  getTracingCountsByProjectInCreationIntervalFromEventsTable,
+  logger,
+} from "@langfuse/shared/src/server";
+import { env } from "@/src/env.mjs";
+import { getSelfHostedInstancePlanServerSide } from "@/src/features/entitlements/server/getPlan";
+import { hasEntitlementBasedOnPlan } from "@/src/features/entitlements/server/hasEntitlement";
 
-// Safe as it is intended to be public
-const POSTHOG_API_KEY = "phc_zkMwFajk8ehObUlMth0D7DtPItFnxETi3lmSvyQDrwB";
-
-// Interval between jobs in milliseconds
-const JOB_INTERVAL_MINUTES = Prisma.raw("60");
+// Interval between jobs in minutes
+const JOB_INTERVAL_MINUTES = Prisma.raw("720"); // 12 hours
 
 // Timeout for job in minutes, if job is not finished in this time, it will be retried
-const JOB_TIMEOUT_MINUTES = Prisma.raw("10");
+const JOB_TIMEOUT_MINUTES = Prisma.raw("10"); // 10 minutes
 
 export async function telemetry() {
   try {
     // Only run in prod
     if (process.env.NODE_ENV !== "production") return;
-    // Do not run in Lanfuse cloud, separate telemetry is used
-    if (process.env.NEXT_PUBLIC_LANGFUSE_CLOUD_REGION !== undefined) return;
-    // Check if telemetry is not disabled
-    if (process.env.TELEMETRY_ENABLED === "false") return;
+    // Do not run in Langfuse cloud, separate telemetry is used
+    if (env.NEXT_PUBLIC_LANGFUSE_CLOUD_REGION !== undefined) return;
+    // Plans with the telemetry opt-out entitlement never send telemetry
+    if (
+      hasEntitlementBasedOnPlan({
+        plan: getSelfHostedInstancePlanServerSide(),
+        entitlement: "self-host-telemetry-opt-out",
+      })
+    )
+      return;
+    // Check if telemetry is not disabled, except for EE
+    if (
+      env.TELEMETRY_ENABLED === "false" &&
+      env.LANGFUSE_EE_LICENSE_KEY === undefined
+    )
+      return;
     // Do not run in CI
     if (process.env.CI) return;
 
@@ -44,7 +65,7 @@ export async function telemetry() {
     }
   } catch (error) {
     // Catch all errors to be sure telemetry does not break the application
-    console.error("Telemetry, unexpected error:", error);
+    logger.error("Telemetry, unexpected error:", error);
   }
 }
 
@@ -84,7 +105,7 @@ async function jobScheduler(): Promise<
     ) AS status;`;
   // Return if job should not run
   if (checkNoLock.length !== 1) {
-    console.error("Telemetry failed to check if job should run");
+    logger.error("Telemetry failed to check if job should run");
     return { shouldRunJob: false };
   }
   if (!checkNoLock[0]!.status) return { shouldRunJob: false };
@@ -118,7 +139,7 @@ async function jobScheduler(): Promise<
 
   // Other job was created in the meantime
   if (createJobLocked.length !== 1) {
-    console.error("Telemetry job is locked");
+    logger.error("Telemetry job is locked");
     return { shouldRunJob: false };
   }
 
@@ -126,7 +147,7 @@ async function jobScheduler(): Promise<
 
   // should not happen
   if (!jobStartedAt) {
-    console.error("Telemetry failed to create job_started_at");
+    logger.error("Telemetry failed to create job_started_at");
     return { shouldRunJob: false };
   }
 
@@ -135,6 +156,45 @@ async function jobScheduler(): Promise<
   const clientId = createJobLocked[0]?.state ?? uuidv4();
 
   return { shouldRunJob: true, jobStartedAt, lastRun, clientId };
+}
+
+/**
+ * Counts traces, observations and AI gateway requests created in `[start, end)`
+ * from the tables the worker writes: under `events_only` the legacy
+ * traces/observations tables are empty, so the events table is the only
+ * source. Gateway requests are reported only there: legacy tables do not mark
+ * gateway rows, and in `dual` mode a second full events scan would cost too
+ * much for that one number.
+ */
+async function countTracing({ start, end }: { start: Date; end: Date }) {
+  if (env.LANGFUSE_MIGRATION_V4_WRITE_MODE === "events_only") {
+    const counts =
+      await getTracingCountsByProjectInCreationIntervalFromEventsTable({
+        start,
+        end,
+      });
+    return {
+      countTraces: counts.reduce((acc, curr) => acc + curr.traces, 0),
+      countObservations: counts.reduce(
+        (acc, curr) => acc + curr.observations,
+        0,
+      ),
+      countGatewayRequests: counts.reduce(
+        (acc, curr) => acc + curr.gatewayRequests,
+        0,
+      ),
+    };
+  }
+
+  const [traces, observations] = await Promise.all([
+    getTraceCountsByProjectInCreationInterval({ start, end }),
+    getObservationCountsByProjectInCreationInterval({ start, end }),
+  ]);
+  return {
+    countTraces: traces.reduce((acc, curr) => acc + curr.count, 0),
+    countObservations: observations.reduce((acc, curr) => acc + curr.count, 0),
+    countGatewayRequests: undefined,
+  };
 }
 
 async function posthogTelemetry({
@@ -147,43 +207,34 @@ async function posthogTelemetry({
   clientId: string;
 }) {
   try {
-    const posthog = new PostHog(POSTHOG_API_KEY, {
-      host: "https://eu.posthog.com",
-    });
-    if (process.env.NODE_ENV === "development") posthog.debug();
-
+    const posthog = new ServerPosthog();
     // Count projects
-    const totalProjects = await prisma.project.count();
-
-    // Count traces
-    const countTraces = await prisma.trace.count({
+    const totalProjects = await prisma.project.count({
       where: {
-        timestamp: {
-          gte: startTimeframe?.toISOString(),
-          lt: endTimeframe.toISOString(),
-        },
+        deletedAt: null,
       },
     });
+
+    // All existing AI gateway keys, including expired ones, not only those created in the timeframe
+    const totalGatewayKeys = await prisma.gatewayApiKeyAssociation.count();
+
+    // Count traces, observations and AI gateway requests
+    const { countTraces, countObservations, countGatewayRequests } =
+      await countTracing({
+        start: startTimeframe ?? new Date(0),
+        end: endTimeframe,
+      });
 
     // Count scores
-    const countScores = await prisma.score.count({
-      where: {
-        timestamp: {
-          gte: startTimeframe?.toISOString(),
-          lt: endTimeframe.toISOString(),
-        },
-      },
-    });
-
-    // Count observations
-    const countObservations = await prisma.observation.count({
-      where: {
-        startTime: {
-          gte: startTimeframe?.toISOString(),
-          lt: endTimeframe.toISOString(),
-        },
-      },
-    });
+    const countScoresClickhouse =
+      await getScoreCountsByProjectInCreationInterval({
+        start: startTimeframe ?? new Date(0),
+        end: endTimeframe,
+      });
+    const countScores = countScoresClickhouse.reduce(
+      (acc, curr) => acc + curr.count,
+      0,
+    );
 
     // Count datasets
     const countDatasets = await prisma.dataset.count({
@@ -215,8 +266,19 @@ async function posthogTelemetry({
       },
     });
 
-    // Count dataset run items
-    const countDatasetRunItems = await prisma.datasetRunItems.count({
+    const countDatasetRunItemsClickhouse =
+      await getDatasetRunItemCountsByProjectInCreationInterval({
+        start: startTimeframe ?? new Date(0),
+        end: endTimeframe,
+      });
+    const countDatasetRunItems = countDatasetRunItemsClickhouse.reduce(
+      (acc, curr) => acc + curr.count,
+      0,
+    );
+
+    // Count Langfuse Assistant runs. Counted unconditionally: zero on an
+    // instance that never enabled the Assistant is itself the answer.
+    const countAssistantRuns = await prisma.inAppAgentRun.count({
       where: {
         createdAt: {
           gte: startTimeframe?.toISOString(),
@@ -244,6 +306,7 @@ async function posthogTelemetry({
         langfuseVersion: VERSION,
         userDomains: domains,
         totalProjects: totalProjects,
+        totalGatewayKeys: totalGatewayKeys,
         traces: countTraces,
         scores: countScores,
         observations: countObservations,
@@ -251,19 +314,27 @@ async function posthogTelemetry({
         datasetItems: countDatasetItems,
         datasetRuns: countDatasetRuns,
         datasetRunItems: countDatasetRunItems,
+        assistantRuns: countAssistantRuns,
+        gatewayRequests: countGatewayRequests,
         startTimeframe: startTimeframe?.toISOString(),
         endTimeframe: endTimeframe.toISOString(),
+        eeLicenseKey: env.LANGFUSE_EE_LICENSE_KEY,
+        langfuseCloudRegion: env.NEXT_PUBLIC_LANGFUSE_CLOUD_REGION,
+        writeMode: env.LANGFUSE_MIGRATION_V4_WRITE_MODE,
+        clickhouseVersion: getDetectedClickHouseVersion(),
         $set: {
           environment: process.env.NODE_ENV,
           userDomains: domains,
           docker: true,
           langfuseVersion: VERSION,
+          writeMode: env.LANGFUSE_MIGRATION_V4_WRITE_MODE,
+          clickhouseVersion: getDetectedClickHouseVersion(),
         },
       },
     });
 
-    await posthog.shutdownAsync();
+    await posthog.shutdown();
   } catch (error) {
-    console.error(error);
+    logger.error(error);
   }
 }

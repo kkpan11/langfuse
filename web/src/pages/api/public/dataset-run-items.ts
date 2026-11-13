@@ -1,168 +1,61 @@
-import { prisma } from "@langfuse/shared/src/db";
-import { type NextApiRequest, type NextApiResponse } from "next";
-import { z } from "zod";
-import { cors, runMiddleware } from "@/src/features/public-api/server/cors";
-import { verifyAuthHeaderAndReturnScope } from "@/src/features/public-api/server/apiAuth";
-import { isPrismaException } from "@/src/utils/exceptions";
-import { jsonSchema } from "@/src/utils/zod";
+import { withMiddlewares } from "@/src/features/public-api/server/withMiddlewares";
+import { createAuthedProjectAPIRoute } from "@/src/features/public-api/server/createAuthedProjectAPIRoute";
+import {
+  GetDatasetRunItemsV1Query,
+  GetDatasetRunItemsV1Response,
+  PostDatasetRunItemsV1Body,
+  PostDatasetRunItemsV1Response,
+} from "@/src/features/public-api/types/datasets";
+import {
+  createDatasetRunItemForApi,
+  buildStableDatasetRunItemResponseEventsOnly,
+  listDatasetRunItemsForApi,
+} from "@/src/features/datasets/server/publicDatasetService";
+import { DATASET_RUN_ITEMS_DEPRECATION } from "@/src/features/public-api/server/deprecations";
+import { env } from "@/src/env.mjs";
 
-const DatasetRunItemPostSchema = z
-  .object({
-    runName: z.string(),
-    runDescription: z.string().nullish(),
-    metadata: jsonSchema.nullish(),
-    datasetItemId: z.string(),
-    observationId: z.string().nullish(),
-    traceId: z.string().nullish(),
-  })
-  .refine((data) => data.observationId || data.traceId, {
-    message: "ObservationId or traceId must be provided",
-    path: ["observationId", "traceId"], // Specify the path of the error
-  });
-
-export default async function handler(
-  req: NextApiRequest,
-  res: NextApiResponse,
-) {
-  await runMiddleware(req, res, cors);
-
-  if (req.method === "POST") {
-    try {
-      // CHECK AUTH
-      const authCheck = await verifyAuthHeaderAndReturnScope(
-        req.headers.authorization,
-      );
-      if (!authCheck.validKey)
-        return res.status(401).json({
-          message: authCheck.error,
-        });
-      // END CHECK AUTH
-
-      if (authCheck.scope.accessLevel !== "all") {
-        return res.status(401).json({
-          message: "Access denied - need to use basic auth with secret key",
+export default withMiddlewares({
+  POST: createAuthedProjectAPIRoute({
+    name: "Create Dataset Run Item",
+    action: "datasets:CUD",
+    bodySchema: PostDatasetRunItemsV1Body,
+    responseSchema: PostDatasetRunItemsV1Response,
+    rateLimitResource: "datasets",
+    // Writes a dataset-run-item event into the legacy dataset_run_items
+    // ClickHouse table. events_only deployments no longer populate that table,
+    // so instead of writing anything we return a stable experiment id (== the
+    // dataset run id) derived deterministically from (projectId, datasetId,
+    // runName). The trace ↔ experiment link is established through OTel
+    // experiment span attributes on ingestion instead.
+    fn: async ({ body, auth, res }) => {
+      if (env.LANGFUSE_MIGRATION_V4_WRITE_MODE === "events_only") {
+        return await buildStableDatasetRunItemResponseEventsOnly({
+          body,
+          auth,
         });
       }
-      console.log(
-        "trying to create dataset run item, project ",
-        authCheck.scope.projectId,
-        ", body:",
-        JSON.stringify(req.body, null, 2),
-      );
-      const {
-        datasetItemId,
-        observationId,
-        traceId,
-        runName,
-        runDescription,
-        metadata,
-      } = DatasetRunItemPostSchema.parse(req.body);
-
-      const datasetItem = await prisma.datasetItem.findUnique({
-        where: {
-          id: datasetItemId,
-          status: "ACTIVE",
-          dataset: {
-            projectId: authCheck.scope.projectId,
-          },
-        },
-        include: {
-          dataset: true,
-        },
+      return await createDatasetRunItemForApi({ body, auth, res });
+    },
+  }),
+  GET: createAuthedProjectAPIRoute({
+    name: "Get Dataset Run Items",
+    action: "datasets:read",
+    querySchema: GetDatasetRunItemsV1Query,
+    responseSchema: GetDatasetRunItemsV1Response,
+    deprecation: DATASET_RUN_ITEMS_DEPRECATION,
+    rateLimitResource: "datasets",
+    // Reads from the legacy dataset_run_items ClickHouse table, which is no
+    // longer populated in events_only mode; GET /api/public/experiment-items
+    // is the replacement.
+    rejectInEventsOnlyMode: true,
+    fn: async ({ query, auth }) => {
+      return await listDatasetRunItemsForApi({
+        datasetId: query.datasetId,
+        runName: query.runName,
+        projectId: auth.scope.projectId,
+        limit: query.limit,
+        page: query.page,
       });
-      if (!datasetItem) {
-        console.error("item not found");
-        return res.status(404).json({
-          message: "Dataset item not found or not active",
-        });
-      }
-
-      const observation = observationId
-        ? await prisma.observation.findUnique({
-            where: {
-              id: observationId,
-              projectId: authCheck.scope.projectId,
-            },
-          })
-        : undefined;
-      if (observationId && !observation) {
-        console.error("Observation not found");
-        return res.status(404).json({
-          message: "Observation not found",
-        });
-      }
-
-      const trace = traceId
-        ? await prisma.trace.findUnique({
-            where: { id: traceId, projectId: authCheck.scope.projectId },
-          })
-        : undefined;
-      if (traceId && !trace) {
-        console.error("Trace not found");
-        return res.status(404).json({
-          message: "Trace not found",
-        });
-      }
-
-      // double check, should not be necessary due to zod schema + validations above
-      const saveTraceId = trace?.id ?? observation?.traceId;
-      if (!!!saveTraceId) {
-        console.error("Observation or Trace not found");
-        return res.status(404).json({
-          message: "Observation or Trace not found",
-        });
-      }
-
-      const run = await prisma.datasetRuns.upsert({
-        where: {
-          datasetId_name: {
-            datasetId: datasetItem.datasetId,
-            name: runName,
-          },
-        },
-        create: {
-          name: runName,
-          description: runDescription ?? undefined,
-          datasetId: datasetItem.datasetId,
-          metadata: metadata ?? undefined,
-        },
-        update: {
-          metadata: metadata ?? undefined,
-          description: runDescription ?? undefined,
-        },
-      });
-
-      const runItem = await prisma.datasetRunItems.create({
-        data: {
-          datasetItemId: datasetItemId,
-          traceId: saveTraceId,
-          observationId: observation?.id ?? undefined,
-          datasetRunId: run.id,
-        },
-      });
-
-      return res.status(200).json(runItem);
-    } catch (error: unknown) {
-      console.error(error);
-      if (error instanceof z.ZodError) {
-        return res.status(400).json({
-          message: "Invalid request data",
-          error: error.errors,
-        });
-      }
-      if (isPrismaException(error)) {
-        return res.status(500).json({
-          error: "Internal Server Error",
-        });
-      }
-      const errorMessage =
-        error instanceof Error ? error.message : "An unknown error occurred";
-      res.status(500).json({
-        message: "Invalid request data",
-        error: errorMessage,
-      });
-    }
-  } else {
-    return res.status(405).json({ message: "Method not allowed" });
-  }
-}
+    },
+  }),
+});

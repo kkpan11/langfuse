@@ -1,27 +1,51 @@
-import { type TimeSeriesChartDataPoint } from "@/src/features/dashboard/components/BaseTimeSeriesChart";
-import { type FilterState } from "@langfuse/shared";
-import { type DatabaseRow } from "@/src/server/api/services/query-builder";
-import { api } from "@/src/utils/api";
+/* eslint-disable @typescript-eslint/no-use-before-define */
+import { type FilterState, getGenerationLikeTypes } from "@langfuse/shared";
+import type { MissingBucketValue } from "@/src/features/widgets/chart-library/chart-props";
 
-export const getAllModels = (
+export type TimeSeriesChartDataPoint = {
+  ts: number;
+  values: { label: string; value?: number }[];
+};
+import { type DatabaseRow } from "@/src/server/api/services/sqlInterface";
+import { type ViewVersion } from "@langfuse/shared/query";
+import { mapLegacyUiTableFilterToView } from "@/src/features/dashboard/lib/dashboardUiTableToViewMapping";
+import { useScheduledDashboardExecuteQuery } from "@/src/features/dashboard/hooks/DashboardQuerySchedulerProvider";
+
+type UseAllModelsOptions = {
+  enabled?: boolean;
+  queryId: string;
+};
+
+export const useAllModels = (
   projectId: string,
   globalFilterState: FilterState,
+  fromTimestamp: Date,
+  toTimestamp: Date,
+  metricsVersion: ViewVersion,
+  options?: UseAllModelsOptions,
 ) => {
-  const allModels = api.dashboard.chart.useQuery(
+  const allModels = useScheduledDashboardExecuteQuery(
     {
       projectId,
-      from: "traces_observations",
-      select: [{ column: "model" }],
-      filter: [
-        ...globalFilterState,
-        {
-          type: "string",
-          column: "type",
-          operator: "=",
-          value: "GENERATION",
-        },
-      ],
-      groupBy: [{ type: "string", column: "model" }],
+      version: metricsVersion,
+      query: {
+        view: "observations",
+        dimensions: [{ field: "providedModelName" }],
+        metrics: [],
+        filters: [
+          ...mapLegacyUiTableFilterToView("observations", globalFilterState),
+          {
+            column: "type",
+            operator: "any of",
+            value: getGenerationLikeTypes(),
+            type: "stringOptions",
+          },
+        ],
+        timeDimension: null,
+        fromTimestamp: fromTimestamp.toISOString(),
+        toTimestamp: toTimestamp.toISOString(),
+        orderBy: null,
+      },
     },
     {
       trpc: {
@@ -29,16 +53,23 @@ export const getAllModels = (
           skipBatch: true,
         },
       },
+      enabled: options?.enabled ?? true,
+      queryId: `${options?.queryId ?? "dashboard:all-models"}:models`,
     },
   );
 
   return allModels.data ? extractAllModels(allModels.data) : [];
 };
 
-const extractAllModels = (data: DatabaseRow[]): string[] => {
+const extractAllModels = (
+  data: Record<string, unknown>[],
+): { model: string; count: number }[] => {
   return data
-    .filter((item) => item.model !== null)
-    .map((item) => item.model as string);
+    .filter((item) => item.providedModelName !== null)
+    .map((item) => ({
+      model: item.providedModelName as string,
+      count: item.count as number,
+    }));
 };
 
 type ChartData = {
@@ -46,16 +77,34 @@ type ChartData = {
   value?: number;
 };
 
+type FieldMappingItem = {
+  uniqueIdentifierColumns: {
+    accessor: string;
+    formatFct?: (value: string) => string;
+  }[];
+  valueColumn: string;
+};
+
+function generateChartLabelFromColumns(
+  uniqueIdentifierColumns: FieldMappingItem["uniqueIdentifierColumns"],
+  row: DatabaseRow,
+): string {
+  return uniqueIdentifierColumns
+    .map(({ accessor, formatFct }) => {
+      if (row[accessor] === null || row[accessor] === undefined) return null;
+      return formatFct
+        ? formatFct(row[accessor] as string)
+        : (row[accessor] as string);
+    })
+    .filter((value) => value !== null)
+    .join(" ");
+}
+
 // we get data for time series in the following format:
 // ts: 123, label1: 1, label2: 2
 // ts: 456, label1: 5, label2: 9
 // This needs to be mapped to the following format:
 // [{ts: 123, values: [{label1: 1, label2: 2}]}, {ts: 456, values: [{label1: 5, label2: 9}]]
-
-type FieldMappingItem = {
-  labelColumn: string;
-  valueColumn: string;
-};
 
 export function extractTimeSeriesData(
   data: DatabaseRow[],
@@ -68,15 +117,18 @@ export function extractTimeSeriesData(
     const reducedData: ChartData[] = [];
     // Map the desired fields from the DatabaseRow to the ChartData based on the mapping provided
     mapping.forEach((mapItem) => {
-      const labelValue = curr[mapItem.labelColumn] as string;
+      const chartLabel = generateChartLabelFromColumns(
+        mapItem.uniqueIdentifierColumns,
+        curr,
+      );
       const columnValue = curr[mapItem.valueColumn];
       if (
-        labelValue &&
+        chartLabel &&
         columnValue !== undefined &&
-        typeof labelValue === "string"
+        typeof chartLabel === "string"
       ) {
         reducedData.push({
-          label: labelValue,
+          label: chartLabel,
           value: columnValue ? (columnValue as number) : 0,
         });
       }
@@ -96,16 +148,22 @@ export function extractTimeSeriesData(
 export function fillMissingValuesAndTransform(
   inputMap: Map<number, ChartData[]>,
   labelsToAdd: string[] = [],
+  missingValue: MissingBucketValue = "zero",
 ): TimeSeriesChartDataPoint[] {
   const result: TimeSeriesChartDataPoint[] = [];
 
   inputMap.forEach((chartDataArray, timestamp) => {
     const existingLabels = chartDataArray.map((value) => value.label);
 
-    // For each label in labelsToAdd, add a default value of 0
+    // For each missing label, add the metric's honest no-data value: a real 0
+    // for additive metrics ("zero"), no value at all for non-additive ones
+    // ("gap") — an average over zero events has no honest value, and a
+    // fabricated 0 draws a fake drop to zero. (LFE-10694)
     labelsToAdd.forEach((label) => {
       if (!existingLabels.includes(label)) {
-        chartDataArray.push({ label: label, value: 0 });
+        chartDataArray.push(
+          missingValue === "zero" ? { label, value: 0 } : { label },
+        );
       }
     });
 
@@ -114,17 +172,27 @@ export function fillMissingValuesAndTransform(
       values: chartDataArray,
     });
   });
-
   return result;
 }
 
-export const isEmptyTimeSeries = (data: TimeSeriesChartDataPoint[]) => {
+export const isEmptyTimeSeries = ({
+  data,
+  isNullValueAllowed = false,
+}: {
+  data: TimeSeriesChartDataPoint[];
+  isNullValueAllowed?: boolean;
+}) => {
   return (
     data.length === 0 ||
     data.every(
       (item) =>
         item.values.length === 0 ||
-        item.values.every((value) => value.value === 0),
+        (isNullValueAllowed
+          ? false
+          : // A gap-filled entry (no value) is as empty as a zero-filled one.
+            item.values.every(
+              (value) => value.value === 0 || value.value == null,
+            )),
     )
   );
 };

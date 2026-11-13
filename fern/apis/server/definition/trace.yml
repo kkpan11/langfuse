@@ -1,52 +1,31 @@
 # yaml-language-server: $schema=https://raw.githubusercontent.com/fern-api/fern/main/fern.schema.json
-imports:
-  pagination: ./utils/pagination.yml
-  commons: ./commons.yml
 service:
   auth: true
   base-path: /api/public
   endpoints:
-    get:
-      docs: Get a specific trace
-      method: GET
+    delete:
+      docs: Delete a specific trace
+      method: DELETE
       path: /traces/{traceId}
       path-parameters:
         traceId:
           type: string
-          docs: The unique langfuse identifier of a trace
-      response: commons.TraceWithFullDetails
-    list:
-      docs: Get list of traces
-      method: GET
+          docs: The unique langfuse identifier of the trace to delete
+      response: DeleteTraceResponse
+    deleteMultiple:
+      docs: Delete multiple traces
+      method: DELETE
       path: /traces
       request:
-        name: GetTracesRequest
-        query-parameters:
-          page:
-            type: optional<integer>
-            docs: page number, starts at 1
-          limit:
-            type: optional<integer>
-            docs: limit of items per page
-          userId: optional<string>
-          name: optional<string>
-          fromTimestamp:
-            type: optional<datetime>
-            docs: Retrieve only traces newer than this timestamp.
-          orderBy:
-            type: optional<string>
-            docs: "Format of the string [field].[asc/desc]. Fields: id, timestamp, name, userId, release, version, public, bookmarked, sessionId. Example: timestamp.asc"
-          tags:
-            type: optional<string>
-            allow-multiple: true
-            docs: Only traces that include all of these tags will be returned.
-      response: Traces
+        name: DeleteTracesRequest
+        body:
+          properties:
+            traceIds:
+              type: list<string>
+              docs: List of trace IDs to delete
+      response: DeleteTraceResponse
 
 types:
-  Traces:
+  DeleteTraceResponse:
     properties:
-      data: list<commons.TraceWithDetails>
-      meta: pagination.MetaResponse
-  Sort:
-    properties:
-      id: string
+      message: string

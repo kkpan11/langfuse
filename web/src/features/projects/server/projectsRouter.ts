@@ -1,84 +1,84 @@
+import { GatewayConfigService } from "@/src/features/ai-gateway/server/config/gatewayConfigService";
+import { ProjectService } from "@/src/features/projects/server/projectService";
 import {
   createTRPCRouter,
-  protectedProcedure,
+  protectedOrganizationProcedure,
   protectedProjectProcedure,
 } from "@/src/server/api/trpc";
 import * as z from "zod";
-import { throwIfNoAccess } from "@/src/features/rbac/utils/checkAccess";
+import {
+  hasOrganizationAccess,
+  throwIfNoOrganizationAccess,
+} from "@/src/features/rbac/utils/checkOrganizationAccess";
+import { throwIfNoProjectAccess } from "@/src/features/rbac/utils/checkProjectAccess";
+import { throwIfNoEntitlement } from "@/src/features/entitlements/server/hasEntitlement";
 import { TRPCError } from "@trpc/server";
 import { projectNameSchema } from "@/src/features/auth/lib/projectNameSchema";
 import { auditLog } from "@/src/features/audit-logs/auditLog";
+import { ApiAuthService } from "@/src/features/public-api/server/apiAuth";
+import {
+  redis,
+  getEnvironmentsForProject,
+  invalidateCachedOrgApiKeys,
+} from "@langfuse/shared/src/server";
+import { StringNoHTMLNonEmpty } from "@langfuse/shared";
+import { emitChbProjectEvent } from "@/src/ee/features/billing/server/chb/chbProjectEvents";
+import { createDefaultScoreConfigs } from "@/src/features/projects/server/defaultScoreConfigs";
 
 export const projectsRouter = createTRPCRouter({
-  all: protectedProcedure.query(async ({ ctx }) => {
-    const memberships = await ctx.prisma.membership.findMany({
-      where: {
-        userId: ctx.session.user.id,
-      },
-      include: {
-        project: true,
-      },
-    });
-    const projects = memberships.map((membership) => ({
-      id: membership.project.id,
-      name: membership.project.name,
-      role: membership.role,
-    }));
-
-    return projects;
-  }),
-  byId: protectedProcedure
+  create: protectedOrganizationProcedure
     .input(
       z.object({
-        projectId: z.string(),
-      }),
-    )
-    .query(async ({ input, ctx }) => {
-      const project = await ctx.prisma.project.findUnique({
-        where: {
-          id: input.projectId,
-        },
-      });
-      if (!project) throw new TRPCError({ code: "NOT_FOUND" });
-
-      const cloudConfigSchema = z.object({
-        plan: z.enum(["Hobby", "Pro", "Team", "Enterprise"]).optional(),
-        monthlyObservationLimit: z.number().int().positive().optional(),
-      });
-      const cloudConfig = cloudConfigSchema.safeParse(project.cloudConfig);
-
-      return {
-        ...project,
-        cloudConfig: cloudConfig.success ? cloudConfig.data : null,
-      };
-    }),
-
-  create: protectedProcedure
-    .input(
-      z.object({
-        name: z.string(),
+        name: StringNoHTMLNonEmpty,
+        orgId: z.string(),
       }),
     )
     .mutation(async ({ input, ctx }) => {
+      throwIfNoOrganizationAccess({
+        session: ctx.session,
+        organizationId: input.orgId,
+        scope: "projects:create",
+      });
+
+      const existingProject = await ctx.prisma.project.findFirst({
+        where: {
+          name: input.name,
+          orgId: input.orgId,
+          deletedAt: null,
+        },
+      });
+
+      if (existingProject) {
+        throw new TRPCError({
+          code: "CONFLICT",
+          message:
+            "A project with this name already exists in your organization",
+        });
+      }
+
       const project = await ctx.prisma.project.create({
         data: {
           name: input.name,
-          members: {
-            create: {
-              userId: ctx.session.user.id,
-              role: "OWNER",
-            },
-          },
+          orgId: input.orgId,
         },
       });
+      await createDefaultScoreConfigs(project.id);
       await auditLog({
+        session: ctx.session,
         resourceType: "project",
         resourceId: project.id,
         action: "create",
-        userId: ctx.session.user.id,
-        projectId: project.id,
-        userProjectRole: "OWNER",
         after: project,
+      });
+
+      // Refresh org-scoped keys' baked projectIds now that a project exists.
+      await invalidateCachedOrgApiKeys(input.orgId);
+
+      // Best-effort CHB metering signal; no-op unless the org is CHB-billed
+      emitChbProjectEvent({
+        type: "LANGFUSE_PROJECT_CREATED",
+        orgId: input.orgId,
+        projectId: project.id,
       });
 
       return {
@@ -96,15 +96,35 @@ export const projectsRouter = createTRPCRouter({
       }),
     )
     .mutation(async ({ input, ctx }) => {
-      throwIfNoAccess({
+      throwIfNoProjectAccess({
         session: ctx.session,
         projectId: input.projectId,
         scope: "project:update",
       });
 
+      // check if the project name is already taken by another project
+      const otherProjectWithSameName = await ctx.prisma.project.findFirst({
+        where: {
+          name: input.newName,
+          orgId: ctx.session.orgId,
+          deletedAt: null,
+          id: {
+            not: input.projectId,
+          },
+        },
+      });
+      if (otherProjectWithSameName) {
+        throw new TRPCError({
+          code: "CONFLICT",
+          message:
+            "A project with this name already exists in your organization",
+        });
+      }
+
       const project = await ctx.prisma.project.update({
         where: {
           id: input.projectId,
+          orgId: ctx.session.orgId,
         },
         data: {
           name: input.newName,
@@ -120,6 +140,64 @@ export const projectsRouter = createTRPCRouter({
       return true;
     }),
 
+  setRetention: protectedProjectProcedure
+    .input(
+      z.object({
+        projectId: z.string(),
+        retention: z.number().int().gte(3).nullable(),
+      }),
+    )
+    .mutation(async ({ input, ctx }) => {
+      throwIfNoProjectAccess({
+        session: ctx.session,
+        projectId: input.projectId,
+        scope: "project:update",
+      });
+      if (input.retention !== null && input.retention > 0) {
+        throwIfNoEntitlement({
+          entitlement: "data-retention",
+          sessionUser: ctx.session.user,
+          projectId: input.projectId,
+        });
+      }
+
+      const project = await ctx.prisma.project.update({
+        where: {
+          id: input.projectId,
+          orgId: ctx.session.orgId,
+        },
+        data: {
+          retentionDays: input.retention,
+        },
+      });
+      await auditLog({
+        session: ctx.session,
+        resourceType: "project",
+        resourceId: input.projectId,
+        action: "update",
+        after: project,
+      });
+      return true;
+    }),
+
+  deletionProtection: protectedProjectProcedure
+    .input(z.object({ projectId: z.string() }))
+    .query(async ({ input, ctx }) => {
+      throwIfNoProjectAccess({
+        session: ctx.session,
+        projectId: input.projectId,
+        scope: "project:delete",
+      });
+      return {
+        isGatewayIngestionProject: await new GatewayConfigService(
+          ctx.prisma,
+        ).isIngestionProject({
+          organizationId: ctx.session.orgId,
+          projectId: input.projectId,
+        }),
+      };
+    }),
+
   delete: protectedProjectProcedure
     .input(
       z.object({
@@ -127,22 +205,23 @@ export const projectsRouter = createTRPCRouter({
       }),
     )
     .mutation(async ({ input, ctx }) => {
-      throwIfNoAccess({
+      throwIfNoProjectAccess({
         session: ctx.session,
-        projectId: input.projectId,
+        projectId: ctx.session.projectId,
         scope: "project:delete",
       });
-      await auditLog({
-        session: ctx.session,
-        resourceType: "project",
-        resourceId: input.projectId,
-        action: "delete",
-      });
-
-      await ctx.prisma.project.delete({
-        where: {
-          id: input.projectId,
-        },
+      await new ProjectService(
+        ctx.prisma,
+        new ApiAuthService(ctx.prisma, redis),
+      ).delete({
+        organizationId: ctx.session.orgId,
+        projectId: input.projectId,
+        actor: { session: ctx.session },
+        canManageGateway: hasOrganizationAccess({
+          session: ctx.session,
+          organizationId: ctx.session.orgId,
+          scope: "gateway:manage",
+        }),
       });
 
       return true;
@@ -152,64 +231,50 @@ export const projectsRouter = createTRPCRouter({
     .input(
       z.object({
         projectId: z.string(),
-        newOwnerEmail: z.string().email(),
+        targetOrgId: z.string(),
       }),
     )
     .mutation(async ({ input, ctx }) => {
-      throwIfNoAccess({
+      // source org
+      throwIfNoOrganizationAccess({
         session: ctx.session,
-        projectId: input.projectId,
-        scope: "project:transfer",
+        organizationId: ctx.session.orgId,
+        scope: "projects:transfer_org",
+      });
+      // destination org
+      throwIfNoOrganizationAccess({
+        session: ctx.session,
+        organizationId: input.targetOrgId,
+        scope: "projects:transfer_org",
       });
 
-      // Check if new owner exists
-      const newOwner = await ctx.prisma.user.findUnique({
+      const project = await ctx.prisma.project.findUnique({
         where: {
-          email: input.newOwnerEmail.toLowerCase(),
+          id: input.projectId,
+          deletedAt: null,
         },
       });
-      if (!newOwner) throw new Error("User not found");
-      if (newOwner.id === ctx.session.user.id)
-        throw new Error("You cannot transfer project to yourself");
+      if (!project) {
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message: "Project not found",
+        });
+      }
 
-      await auditLog({
-        session: ctx.session,
-        resourceType: "project",
-        resourceId: input.projectId,
-        action: "transfer",
-        after: { ownerId: newOwner.id },
+      await new ProjectService(
+        ctx.prisma,
+        new ApiAuthService(ctx.prisma, redis),
+      ).transfer({
+        organizationId: ctx.session.orgId,
+        targetOrganizationId: input.targetOrgId,
+        projectId: input.projectId,
+        actor: { session: ctx.session },
       });
-
-      return ctx.prisma.$transaction([
-        // Add new owner, upsert to update role if already exists
-        ctx.prisma.membership.upsert({
-          where: {
-            projectId_userId: {
-              projectId: input.projectId,
-              userId: newOwner.id,
-            },
-          },
-          update: {
-            role: "OWNER",
-          },
-          create: {
-            userId: newOwner.id,
-            projectId: input.projectId,
-            role: "OWNER",
-          },
-        }),
-        // Update old owner to admin
-        ctx.prisma.membership.update({
-          where: {
-            projectId_userId: {
-              projectId: input.projectId,
-              userId: ctx.session.user.id,
-            },
-          },
-          data: {
-            role: "ADMIN",
-          },
-        }),
-      ]);
     }),
+
+  environmentFilterOptions: protectedProjectProcedure
+    .input(
+      z.object({ projectId: z.string(), fromTimestamp: z.date().optional() }),
+    )
+    .query(async ({ input }) => getEnvironmentsForProject(input)),
 });

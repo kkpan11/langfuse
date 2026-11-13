@@ -1,78 +1,123 @@
-import { type NextApiRequest, type NextApiResponse } from "next";
-import { z } from "zod";
-import { cors, runMiddleware } from "@/src/features/public-api/server/cors";
 import { prisma } from "@langfuse/shared/src/db";
-import { verifyAuthHeaderAndReturnScope } from "@/src/features/public-api/server/apiAuth";
-import { mapUsageOutput } from "@/src/features/public-api/server/outputSchemaConversion";
-import { isPrismaException } from "@/src/utils/exceptions";
+import {
+  GetObservationV1Query,
+  GetObservationV1Response,
+  transformDbToApiObservation,
+} from "@/src/features/public-api/types/observations";
+import {
+  LEGACY_PUBLIC_API_OBSERVATIONS_CLICKHOUSE_RESOURCE_ERROR_MESSAGE,
+  withMiddlewares,
+} from "@/src/features/public-api/server/withMiddlewares";
+import { createAuthedProjectAPIRoute } from "@/src/features/public-api/server/createAuthedProjectAPIRoute";
+import { LangfuseNotFoundError } from "@langfuse/shared";
+import {
+  enrichObservationWithModelData,
+  getObservationById,
+  getObservationByIdFromEventsTable,
+} from "@langfuse/shared/src/server";
+import { legacyPublicApiRateLimitUpgradePaths } from "@/src/features/public-api/server/rateLimitUpgradePaths";
+import { OBSERVATIONS_V1_DEPRECATION } from "@/src/features/public-api/server/deprecations";
 
-const GetObservationSchema = z.object({
-  observationId: z.string(),
-});
+export default withMiddlewares(
+  {
+    GET: createAuthedProjectAPIRoute({
+      name: "Get Observation",
+      action: "traces:read",
+      allowInAppAgentKey: true,
+      rateLimitResource: "public-api-legacy",
+      querySchema: GetObservationV1Query,
+      responseSchema: GetObservationV1Response,
+      rateLimitUpgradePath: legacyPublicApiRateLimitUpgradePaths.observationGet,
+      rejectInEventsOnlyMode: true,
+      deprecation: OBSERVATIONS_V1_DEPRECATION,
+      fn: async ({ query, auth }) => {
+        const startTime = query.startTime
+          ? new Date(query.startTime)
+          : undefined;
 
-export default async function handler(
-  req: NextApiRequest,
-  res: NextApiResponse,
-) {
-  await runMiddleware(req, res, cors);
+        const lookupObservation = (withStartTime: boolean) =>
+          query.useEventsTable
+            ? getObservationByIdFromEventsTable({
+                id: query.observationId,
+                projectId: auth.scope.projectId,
+                fetchWithInputOutput: true,
+                startTime: withStartTime ? startTime : undefined,
+              })
+            : // eslint-disable-next-line @typescript-eslint/no-deprecated
+              getObservationById({
+                id: query.observationId,
+                projectId: auth.scope.projectId,
+                fetchWithInputOutput: true,
+                startTime: withStartTime ? startTime : undefined,
+                preferredClickhouseService: "ReadOnly",
+              });
 
-  if (req.method !== "GET") {
-    console.error(req.method, req.body, req.query);
-    return res.status(405).json({ message: "Method not allowed" });
-  }
+        // startTime is a performance hint: it bounds the lookup to its minute so
+        // ClickHouse can prune parts/partitions. On a miss we retry unbounded,
+        // so a wrong or stale hint only ever costs speed, never correctness.
+        let clickhouseObservation;
+        try {
+          clickhouseObservation = await lookupObservation(true);
+        } catch (e) {
+          if (!(e instanceof LangfuseNotFoundError) || !startTime) throw e;
+          clickhouseObservation = await lookupObservation(false);
+        }
 
-  try {
-    // CHECK AUTH
-    const authCheck = await verifyAuthHeaderAndReturnScope(
-      req.headers.authorization,
-    );
-    if (!authCheck.validKey)
-      return res.status(401).json({
-        message: authCheck.error,
-      });
-    // END CHECK AUTH
-    console.log("Trying to get observation:", req.body, req.query);
+        if (!clickhouseObservation) {
+          throw new LangfuseNotFoundError(
+            "Observation not found within authorized project",
+          );
+        }
 
-    const { observationId } = GetObservationSchema.parse(req.query);
+        const model = clickhouseObservation.internalModelId
+          ? await prisma.model.findFirst({
+              where: {
+                AND: [
+                  {
+                    id: clickhouseObservation.internalModelId,
+                  },
+                  {
+                    OR: [
+                      {
+                        projectId: auth.scope.projectId,
+                      },
+                      {
+                        projectId: null,
+                      },
+                    ],
+                  },
+                ],
+              },
+              include: {
+                Price: {
+                  where: { pricingTier: { isDefault: true } },
+                },
+              },
+              orderBy: {
+                projectId: {
+                  sort: "desc",
+                  nulls: "last",
+                },
+              },
+            })
+          : undefined;
 
-    // CHECK ACCESS SCOPE
-    if (authCheck.scope.accessLevel !== "all") {
-      return res.status(401).json({
-        message: "Access denied - need to use basic auth with secret key",
-      });
-    }
-    // END CHECK ACCESS SCOPE
+        const observation = {
+          ...clickhouseObservation,
+          ...enrichObservationWithModelData(model),
+        };
 
-    const observation = await prisma.observationView.findFirst({
-      where: {
-        id: observationId,
-        projectId: authCheck.scope.projectId,
+        if (!observation) {
+          throw new LangfuseNotFoundError(
+            "Observation not found within authorized project",
+          );
+        }
+        return transformDbToApiObservation(observation);
       },
-    });
-    if (!observation) {
-      return res.status(404).json({
-        message: "Observation not found within authorized project",
-      });
-    }
-    return res.status(200).json(mapUsageOutput(observation));
-  } catch (error: unknown) {
-    console.error(error);
-    if (isPrismaException(error)) {
-      return res.status(500).json({
-        error: "Internal Server Error",
-      });
-    }
-    if (error instanceof z.ZodError) {
-      return res.status(400).json({
-        message: "Invalid request data",
-        error: error.errors,
-      });
-    }
-    const errorMessage =
-      error instanceof Error ? error.message : "An unknown error occurred";
-    res.status(500).json({
-      message: "Invalid request data",
-      error: errorMessage,
-    });
-  }
-}
+    }),
+  },
+  {
+    clickHouseResourceErrorMessage:
+      LEGACY_PUBLIC_API_OBSERVATIONS_CLICKHOUSE_RESOURCE_ERROR_MESSAGE,
+  },
+);

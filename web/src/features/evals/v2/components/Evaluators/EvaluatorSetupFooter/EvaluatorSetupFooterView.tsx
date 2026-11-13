@@ -1,0 +1,70 @@
+/* eslint-disable @typescript-eslint/no-deprecated -- Legacy UI usage retained during migration to design-system components. */
+import { ArrowRight } from "@langfuse/icons";
+import { Button } from "@/src/components/ui/button";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/src/components/ui/tooltip";
+import { cn } from "@/src/utils/tailwind";
+
+type EvaluatorSetupFooterViewBaseProps = {
+  closeLabel: string;
+  saveLabel: string;
+  isSaving: boolean;
+  saveDisabled: boolean;
+  disabledReason: string | null;
+  onClose: () => void;
+  onSave: () => void;
+};
+
+export type EvaluatorSetupFooterViewProps =
+  EvaluatorSetupFooterViewBaseProps & {
+    mode: "create" | "edit";
+  };
+
+export function EvaluatorSetupFooterView(props: EvaluatorSetupFooterViewProps) {
+  const {
+    closeLabel,
+    saveLabel,
+    isSaving,
+    saveDisabled,
+    disabledReason,
+    onClose,
+    onSave,
+  } = props;
+  const saveButton = (
+    <Button
+      type="button"
+      disabled={saveDisabled}
+      loading={isSaving}
+      className={cn("gap-1.5", disabledReason && "pointer-events-none")}
+      onClick={onSave}
+    >
+      {saveLabel}
+      {props.mode === "create" ? (
+        <ArrowRight size="base" aria-hidden="true" />
+      ) : null}
+    </Button>
+  );
+
+  return (
+    <div className="flex shrink-0 items-center justify-end gap-2 border-t px-6 py-3">
+      <Button type="button" variant="outline" onClick={onClose}>
+        {closeLabel}
+      </Button>
+      {disabledReason ? (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <span className="inline-flex cursor-not-allowed" tabIndex={0}>
+              {saveButton}
+            </span>
+          </TooltipTrigger>
+          <TooltipContent>{disabledReason}</TooltipContent>
+        </Tooltip>
+      ) : (
+        saveButton
+      )}
+    </div>
+  );
+}

@@ -1,50 +1,56 @@
-import { Button } from "@/src/components/ui/button";
-import { LockIcon, PlusIcon } from "lucide-react";
+/* eslint-disable @typescript-eslint/no-deprecated -- Legacy UI usage retained during migration to design-system components. */
+import { PlusIcon } from "@langfuse/icons";
 import {
   Dialog,
   DialogContent,
   DialogHeader,
   DialogTitle,
 } from "@/src/components/ui/dialog";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { NewDatasetItemForm } from "@/src/features/datasets/components/NewDatasetItemForm";
 import { DialogTrigger } from "@radix-ui/react-dialog";
-import { useHasAccess } from "@/src/features/rbac/utils/checkAccess";
+import { useHasProjectAccess } from "@/src/features/rbac/utils/checkProjectAccess";
+import { ActionButton } from "@/src/components/ActionButton";
 
 export const NewDatasetItemButton = (props: {
   projectId: string;
   datasetId?: string;
-  className?: string;
 }) => {
   const [open, setOpen] = useState(false);
-  const hasAccess = useHasAccess({
+  const submissionPending = useRef(false);
+  const hasAccess = useHasProjectAccess({
     projectId: props.projectId,
     scope: "datasets:CUD",
   });
   return (
-    <Dialog open={hasAccess && open} onOpenChange={setOpen}>
+    <Dialog
+      open={hasAccess && open}
+      onOpenChange={(next) => {
+        if (!submissionPending.current) setOpen(next);
+      }}
+    >
       <DialogTrigger asChild>
-        <Button
-          variant="secondary"
-          className={props.className}
-          disabled={!hasAccess}
+        <ActionButton
+          variant="outline"
+          hasAccess={hasAccess}
+          trackingEventName="dataset_item:new_form_open"
+          icon={<PlusIcon size="base" aria-hidden="true" />}
         >
-          {hasAccess ? (
-            <PlusIcon className="-ml-0.5 mr-1.5" aria-hidden="true" />
-          ) : (
-            <LockIcon className="-ml-0.5 mr-1.5 h-3 w-3" aria-hidden="true" />
-          )}
           New item
-        </Button>
+        </ActionButton>
       </DialogTrigger>
-      <DialogContent className="sm:max-w-3xl">
+      <DialogContent size="lg">
         <DialogHeader>
-          <DialogTitle className="mb-5">Create new dataset item</DialogTitle>
+          <DialogTitle>Create new dataset item</DialogTitle>
         </DialogHeader>
         <NewDatasetItemForm
           projectId={props.projectId}
           datasetId={props.datasetId}
+          onPendingChange={(pending) => {
+            submissionPending.current = pending;
+          }}
           onFormSuccess={() => setOpen(false)}
+          className="h-full overflow-y-auto"
         />
       </DialogContent>
     </Dialog>

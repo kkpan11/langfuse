@@ -1,84 +1,66 @@
-import { type NextApiRequest, type NextApiResponse } from "next";
-import { z } from "zod";
-import { cors, runMiddleware } from "@/src/features/public-api/server/cors";
 import { prisma } from "@langfuse/shared/src/db";
-import { verifyAuthHeaderAndReturnScope } from "@/src/features/public-api/server/apiAuth";
-import { isPrismaException } from "@/src/utils/exceptions";
+import {
+  GetSessionV1Query,
+  GetSessionV1Response,
+} from "@/src/features/public-api/types/sessions";
+import { withMiddlewares } from "@/src/features/public-api/server/withMiddlewares";
+import { createAuthedProjectAPIRoute } from "@/src/features/public-api/server/createAuthedProjectAPIRoute";
+import { LangfuseNotFoundError } from "@langfuse/shared";
+import {
+  getTracesBySessionId,
+  isStorableTraceSessionId,
+} from "@langfuse/shared/src/server";
+import { legacyPublicApiRateLimitUpgradePaths } from "@/src/features/public-api/server/rateLimitUpgradePaths";
+import { SESSIONS_DEPRECATION } from "@/src/features/public-api/server/deprecations";
 
-const GetSessionSchema = z.object({
-  sessionId: z.string(),
+export default withMiddlewares({
+  GET: createAuthedProjectAPIRoute({
+    name: "Get Session",
+    action: "sessions:read",
+    deprecation: SESSIONS_DEPRECATION,
+    rateLimitResource: "public-api-legacy",
+    querySchema: GetSessionV1Query,
+    responseSchema: GetSessionV1Response,
+    rateLimitUpgradePath: legacyPublicApiRateLimitUpgradePaths.sessionGet,
+    // Reads from the legacy traces ClickHouse table via getTracesBySessionId,
+    // which has no events_full fallback.
+    rejectInEventsOnlyMode: true,
+    fn: async ({ query, auth }) => {
+      const { sessionId } = query;
+      const session = !isStorableTraceSessionId(sessionId)
+        ? null
+        : await prisma.traceSession.findUnique({
+            where: {
+              id_projectId: {
+                id: sessionId,
+                projectId: auth.scope.projectId,
+              },
+            },
+            select: {
+              id: true,
+              createdAt: true,
+              projectId: true,
+              environment: true,
+            },
+          });
+
+      if (!session) {
+        throw new LangfuseNotFoundError(
+          "Session not found within authorized project",
+        );
+      }
+
+      const traces = await getTracesBySessionId(auth.scope.projectId, [
+        sessionId,
+      ]);
+
+      return {
+        ...session,
+        traces: traces.map((trace) => ({
+          ...trace,
+          externalId: null,
+        })),
+      };
+    },
+  }),
 });
-
-export default async function handler(
-  req: NextApiRequest,
-  res: NextApiResponse,
-) {
-  await runMiddleware(req, res, cors);
-
-  if (req.method !== "GET") {
-    console.error(req.method, req.body, req.query);
-    return res.status(405).json({ message: "Method not allowed" });
-  }
-
-  try {
-    // CHECK AUTH
-    const authCheck = await verifyAuthHeaderAndReturnScope(
-      req.headers.authorization,
-    );
-    if (!authCheck.validKey)
-      return res.status(401).json({
-        message: authCheck.error,
-      });
-    // END CHECK AUTH
-    console.log("Trying to get session:", req.body, req.query);
-
-    const { sessionId } = GetSessionSchema.parse(req.query);
-
-    // CHECK ACCESS SCOPE
-    if (authCheck.scope.accessLevel !== "all") {
-      return res.status(401).json({
-        message: "Access denied - need to use basic auth with secret key",
-      });
-    }
-    // END CHECK ACCESS SCOPE
-
-    const session = await prisma.traceSession.findUnique({
-      where: {
-        id_projectId: {
-          id: sessionId,
-          projectId: authCheck.scope.projectId,
-        },
-      },
-      include: {
-        traces: true,
-      },
-    });
-
-    if (!session) {
-      return res.status(404).json({
-        message: "Session not found within authorized project",
-      });
-    }
-    return res.status(200).json(session);
-  } catch (error: unknown) {
-    console.error(error);
-
-    if (isPrismaException(error)) {
-      return res.status(500).json({
-        error: "Internal Server Error",
-      });
-    }
-    if (error instanceof z.ZodError) {
-      return res.status(400).json({
-        message: "Invalid request data",
-        error: error.errors,
-      });
-    }
-    const errorMessage =
-      error instanceof Error ? error.message : "An unknown error occurred";
-    res.status(500).json({
-      message: "Invalid request data",
-      error: errorMessage,
-    });
-  }
-}

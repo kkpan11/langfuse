@@ -1,88 +1,60 @@
-import { type NextApiRequest, type NextApiResponse } from "next";
-import { cors, runMiddleware } from "@/src/features/public-api/server/cors";
-import { verifyAuthHeaderAndReturnScope } from "@/src/features/public-api/server/apiAuth";
-import { v4 as uuidv4 } from "uuid";
 import {
-  CreateEventEvent,
+  PostEventsV1Body,
+  PostEventsV1Response,
+} from "@/src/features/public-api/types/events";
+import { withMiddlewares } from "@/src/features/public-api/server/withMiddlewares";
+import { createAuthedProjectAPIRoute } from "@/src/features/public-api/server/createAuthedProjectAPIRoute";
+import { LEGACY_WRITES_DEPRECATION } from "@/src/features/public-api/server/deprecations";
+import {
+  createIngestionAttribution,
   eventTypes,
-  ingestionBatchEvent,
-} from "@/src/features/public-api/server/ingestion-api-schema";
-import {
-  handleBatch,
-  handleBatchResultLegacy,
-} from "@/src/pages/api/public/ingestion";
-import { z } from "zod";
-import { isPrismaException } from "@/src/utils/exceptions";
+  logger,
+  processEventBatch,
+} from "@langfuse/shared/src/server";
+import { v4 } from "uuid";
 
-export default async function handler(
-  req: NextApiRequest,
-  res: NextApiResponse,
-) {
-  await runMiddleware(req, res, cors);
-
-  if (req.method !== "POST") {
-    return res.status(405).json({ message: "Method not allowed" });
-  }
-
-  // CHECK AUTH
-  const authCheck = await verifyAuthHeaderAndReturnScope(
-    req.headers.authorization,
-  );
-  if (!authCheck.validKey)
-    return res.status(401).json({
-      message: authCheck.error,
-    });
-  // END CHECK AUTH
-
-  console.log(
-    "trying to create observation for event, project ",
-    authCheck.scope.projectId,
-    ", body:",
-    JSON.stringify(req.body, null, 2),
-  );
-
-  try {
-    const convertToObservation = (
-      generation: z.infer<typeof CreateEventEvent>,
-    ) => {
-      return {
-        ...generation,
-        type: "EVENT",
+export default withMiddlewares({
+  POST: createAuthedProjectAPIRoute({
+    name: "Create Event",
+    action: "traces:create",
+    bodySchema: PostEventsV1Body,
+    responseSchema: PostEventsV1Response,
+    // Writes an observation-create event that lands in the legacy observations
+    // ClickHouse table; events_only deployments expect OTel ingestion.
+    rejectInEventsOnlyMode: true,
+    isLegacyTraceWrite: true,
+    deprecation: LEGACY_WRITES_DEPRECATION,
+    fn: async ({ body, auth, req, res }) => {
+      const event = {
+        id: v4(),
+        type: eventTypes.OBSERVATION_CREATE,
+        timestamp: new Date().toISOString(),
+        body: {
+          ...body,
+          type: "EVENT",
+        },
       };
-    };
-
-    const event = {
-      id: uuidv4(),
-      type: eventTypes.OBSERVATION_CREATE,
-      timestamp: new Date().toISOString(),
-      body: convertToObservation(CreateEventEvent.parse(req.body)),
-    };
-
-    const result = await handleBatch(
-      ingestionBatchEvent.parse([event]),
-      {},
-      req,
-      authCheck,
-    );
-    handleBatchResultLegacy(result.errors, result.results, res);
-  } catch (error: unknown) {
-    console.error(error);
-    if (error instanceof z.ZodError) {
-      return res.status(400).json({
-        message: "Invalid request data",
-        error: error.errors,
+      if (!event.body.id) {
+        event.body.id = v4();
+      }
+      const result = await processEventBatch([event], auth, {
+        attribution: createIngestionAttribution({
+          headers: req.headers,
+          authCheck: auth,
+        }),
       });
-    }
-    if (isPrismaException(error)) {
-      return res.status(500).json({
-        error: "Internal Server Error",
-      });
-    }
-    const errorMessage =
-      error instanceof Error ? error.message : "An unknown error occurred";
-    res.status(500).json({
-      message: "Invalid request data",
-      error: errorMessage,
-    });
-  }
-}
+      if (result.errors.length > 0) {
+        const error = result.errors[0];
+        res
+          .status(error.status)
+          .json({ message: error.error ?? error.message });
+        return { id: "" }; // dummy return
+      }
+      if (result.successes.length !== 1) {
+        logger.error("Failed to create event", { result });
+        throw new Error("Failed to create event");
+      }
+      return { id: event.body.id };
+    },
+  }),
+});

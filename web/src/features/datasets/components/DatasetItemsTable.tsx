@@ -1,59 +1,131 @@
+/* eslint-disable no-nested-ternary */
 import { DataTable } from "@/src/components/table/data-table";
-import TableLink from "@/src/components/table/table-link";
+import { createDropdownTableColumn } from "@/src/components/design-system/table/columns/createDropdownTableColumn";
+import { createLinkTableColumn } from "@/src/components/design-system/table/columns/createLinkTableColumn";
 import { api } from "@/src/utils/api";
+import { safeExtract } from "@/src/utils/map-utils";
 import { type RouterOutput } from "@/src/utils/types";
 import {
-  DropdownMenu,
-  DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuLabel,
-  DropdownMenuTrigger,
 } from "@/src/components/ui/dropdown-menu";
 import { useQueryParams, withDefault, NumberParam } from "use-query-params";
-
-import { Archive, MoreVertical } from "lucide-react";
-import { Button } from "@/src/components/ui/button";
-import { type DatasetItem, DatasetStatus } from "@langfuse/shared";
-import { cn } from "@/src/utils/tailwind";
+import { useMediaQuery } from "react-responsive";
+import { Archive, Edit, ListTree, Trash2 } from "@langfuse/icons";
+import {
+  datasetItemFilterColumns,
+  DatasetStatus,
+  type Prisma,
+  BatchExportTableName,
+} from "@langfuse/shared";
 import { type LangfuseColumnDef } from "@/src/components/table/types";
-import { useDetailPageLists } from "@/src/features/navigate-detail-pages/context";
-import { useEffect } from "react";
+import { useDetailPageLists } from "@/src/features/navigate-detail-pages/DetailPageListsProvider";
+import { useEffect, useState } from "react";
+import { DataTableToolbar } from "@/src/components/table/data-table-toolbar";
+import { default as useColumnOrder } from "@/src/features/column-visibility/hooks/useColumnOrder";
+import { default as useColumnVisibility } from "@/src/features/column-visibility/hooks/useColumnVisibility";
+import {
+  customRowHeightMenu,
+  isCompactRowHeight,
+  useRowHeightLocalStorage,
+} from "@/src/components/table/data-table-row-height-switch";
+import { createIOTableColumn } from "@/src/components/design-system/table/columns/createIOTableColumn";
+import { usePostHogClientCapture } from "@/src/features/posthog-analytics/usePostHogClientCapture";
+import { createStatusTableColumn } from "@/src/components/design-system/table/columns/createStatusTableColumn";
+import { type Status } from "@/src/components/ui/StatusBadge/StatusBadge";
+import { useHasProjectAccess } from "@/src/features/rbac/utils/checkProjectAccess";
+import { createDateTableColumn } from "@/src/components/design-system/table/columns/createDateTableColumn";
+import { BatchExportTableButton } from "@/src/components/BatchExportTableButton";
+import { useQueryFilterState } from "@/src/features/filters/hooks/useFilterState";
+import { useDebounce } from "@/src/hooks/useDebounce";
+import { useFullTextSearch } from "@/src/features/search-bar/hooks/useFullTextSearch";
+import { TableSearchBar } from "@/src/features/search-bar/components/TableSearchBar";
+import { DATASET_ITEMS_FIELD_REGISTRY } from "../constants/datasetItemsSearchRegistry";
+import { useDatasetVersion } from "../hooks/useDatasetVersion";
+import { EditDatasetItemDialog } from "./EditDatasetItemDialog";
 
 type RowData = {
   id: string;
-  status: DatasetItem["status"];
-  createdAt: string;
-  input: string;
-  expectedOutput: string;
+  source?: {
+    traceId: string;
+    observationId?: string;
+  };
+  status: DatasetStatus;
+  createdAt: Date;
+  input: Prisma.JsonValue;
+  expectedOutput: Prisma.JsonValue;
+  metadata: Prisma.JsonValue;
 };
+
+const datasetStatusToStatus = {
+  [DatasetStatus.ACTIVE]: "active",
+  [DatasetStatus.ARCHIVED]: "archived",
+} satisfies Record<DatasetStatus, Status>;
 
 export function DatasetItemsTable({
   projectId,
   datasetId,
+  menuItems,
 }: {
   projectId: string;
   datasetId: string;
+  menuItems?: React.ReactNode;
 }) {
   const { setDetailPageList } = useDetailPageLists();
   const utils = api.useUtils();
-
+  const capture = usePostHogClientCapture();
   const [paginationState, setPaginationState] = useQueryParams({
     pageIndex: withDefault(NumberParam, 0),
     pageSize: withDefault(NumberParam, 50),
   });
 
+  const [rowHeight, setRowHeight, rowHeights] = useRowHeightLocalStorage(
+    "datasetItems",
+    "m",
+  );
+  const compactRows = isCompactRowHeight(
+    rowHeight,
+    rowHeights.mode,
+    rowHeights.activeHeightPx,
+  );
+
+  const [filterState, setFilterState] = useQueryFilterState(
+    [],
+    "dataset_items",
+    projectId,
+  );
+
+  const { searchQuery, searchType, setSearchQuery, setSearchType } =
+    useFullTextSearch();
+
+  const hasAccess = useHasProjectAccess({ projectId, scope: "datasets:CUD" });
+  const hasBatchExportAccess = useHasProjectAccess({
+    projectId,
+    scope: "batchExports:create",
+  });
+  const { selectedVersion } = useDatasetVersion();
+  const [editDialogOpen, setEditDialogOpen] = useState(false);
+  const [selectedItemForEdit, setSelectedItemForEdit] = useState<string | null>(
+    null,
+  );
+
   const items = api.datasets.itemsByDatasetId.useQuery({
     projectId,
     datasetId,
+    filter: filterState,
     page: paginationState.pageIndex,
     limit: paginationState.pageSize,
+    searchQuery: searchQuery ?? undefined,
+    searchType: searchType,
+    version: selectedVersion ?? undefined,
   });
 
   useEffect(() => {
     if (items.isSuccess) {
+      const { datasetItems = [] } = items.data ?? {};
       setDetailPageList(
         "datasetItems",
-        items.data.datasetItems.map((t) => t.id),
+        datasetItems.map((t) => ({ id: t.id })),
       );
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -63,121 +135,285 @@ export function DatasetItemsTable({
     onSuccess: () => utils.datasets.invalidate(),
   });
 
-  const columns: LangfuseColumnDef<RowData>[] = [
+  const mutDelete = api.datasets.deleteDatasetItem.useMutation({
+    onSuccess: () => utils.datasets.invalidate(),
+  });
+
+  // Fetch selected item and dataset for edit dialog
+  const selectedItem = api.datasets.itemById.useQuery(
     {
+      projectId,
+      datasetId,
+      datasetItemId: selectedItemForEdit!,
+    },
+    {
+      enabled: selectedItemForEdit !== null && editDialogOpen,
+    },
+  );
+
+  const dataset = api.datasets.byId.useQuery(
+    {
+      projectId,
+      datasetId,
+    },
+    {
+      enabled: editDialogOpen,
+    },
+  );
+
+  const columns: LangfuseColumnDef<RowData>[] = [
+    createLinkTableColumn<RowData>({
       accessorKey: "id",
       header: "Item id",
-      cell: ({ row }) => {
-        const id: string = row.getValue("id");
-        return (
-          <TableLink
-            path={`/project/${projectId}/datasets/${datasetId}/items/${id}`}
-            value={id}
-            truncateAt={7}
-          />
-        );
+      size: 90,
+      isFixedPosition: true,
+      getCell: (id) => {
+        if (!id) return undefined;
+        let versionParam = "";
+        if (selectedVersion) {
+          versionParam = `?version=${encodeURIComponent(selectedVersion.toISOString())}`;
+        }
+        return {
+          type: "link",
+          props: {
+            path: `/project/${projectId}/datasets/${datasetId}/items/${encodeURIComponent(id)}${versionParam}`,
+            value: id,
+          },
+        };
       },
-    },
-    {
+    }),
+    createLinkTableColumn<RowData, RowData["source"]>({
+      accessorKey: "source",
+      header: "Source",
+      headerTooltip: {
+        description:
+          "Link to the source trace based on which this item was added",
+      },
+      size: 90,
+      getCell: (source) => {
+        if (!source) return undefined;
+        if (source.observationId) {
+          return {
+            type: "link",
+            props: {
+              path: `/project/${projectId}/traces/${encodeURIComponent(source.traceId)}?observation=${encodeURIComponent(source.observationId)}`,
+              value: source.observationId,
+              icon: ListTree,
+            },
+          };
+        }
+        return {
+          type: "link",
+          props: {
+            path: `/project/${projectId}/traces/${encodeURIComponent(source.traceId)}`,
+            value: source.traceId,
+            icon: ListTree,
+          },
+        };
+      },
+    }),
+    createStatusTableColumn<RowData, DatasetStatus>({
       accessorKey: "status",
       header: "Status",
-      cell: ({ row }) => {
-        const status: DatasetStatus = row.getValue("status");
-        return (
-          <div className="flex items-center gap-2">
-            <div
-              className={cn(
-                "h-2 w-2 rounded-full",
-                status === DatasetStatus.ACTIVE
-                  ? "bg-green-600"
-                  : "bg-yellow-600",
-              )}
-            />
-            <span>{status}</span>
-          </div>
-        );
-      },
-    },
-    {
+      getStatus: (status) =>
+        status ? datasetStatusToStatus[status] : undefined,
+      size: 80,
+      isLive: false,
+    }),
+    createDateTableColumn<RowData>({
       accessorKey: "createdAt",
-      header: "Created",
-    },
-    {
+      header: "Created At",
+      size: 150,
+      enableHiding: true,
+    }),
+    createIOTableColumn<RowData>({
       accessorKey: "input",
       header: "Input",
-    },
-    {
+      size: 200,
+      enableHiding: true,
+      singleLine: compactRows,
+    }),
+    createIOTableColumn<RowData>({
       accessorKey: "expectedOutput",
       header: "Expected Output",
-    },
-    {
+      size: 200,
+      enableHiding: true,
+      singleLine: compactRows,
+      variant: "output",
+    }),
+    createIOTableColumn<RowData>({
+      accessorKey: "metadata",
+      header: "Metadata",
+      size: 200,
+      enableHiding: true,
+      singleLine: compactRows,
+    }),
+    createDropdownTableColumn<RowData, string>({
       id: "actions",
-      accessorKey: "actions",
+      accessorFn: (row) => row.id,
       header: "Actions",
-      cell: ({ row }) => {
-        const id: string = row.getValue("id");
-        const status: DatasetStatus = row.getValue("status");
+      size: 70,
+      renderMenu: (id, { row }) => {
+        if (!id) return null;
+        const status = row.original.status;
         return (
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <Button variant="ghost" className="h-8 w-8 p-0">
-                <span className="sr-only">Open menu</span>
-                <MoreVertical className="h-4 w-4" />
-              </Button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="end">
-              <DropdownMenuLabel>Actions</DropdownMenuLabel>
-              <DropdownMenuItem
-                onClick={() =>
-                  mutUpdate.mutate({
+          <>
+            <DropdownMenuLabel>Actions</DropdownMenuLabel>
+            <DropdownMenuItem
+              disabled={!hasAccess || !!selectedVersion}
+              onClick={() => {
+                setSelectedItemForEdit(id);
+                setEditDialogOpen(true);
+              }}
+            >
+              <Edit size="base" color="default" __rawClassName="mr-2" />
+              Edit
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              disabled={!hasAccess || !!selectedVersion}
+              onClick={() => {
+                capture("dataset_item:archive_toggle", {
+                  status:
+                    status === DatasetStatus.ARCHIVED
+                      ? "unarchived"
+                      : "archived",
+                });
+                mutUpdate.mutate({
+                  projectId: projectId,
+                  datasetId: datasetId,
+                  datasetItemId: id,
+                  status:
+                    status === DatasetStatus.ARCHIVED
+                      ? DatasetStatus.ACTIVE
+                      : DatasetStatus.ARCHIVED,
+                });
+              }}
+            >
+              <Archive size="base" color="default" __rawClassName="mr-2" />
+              {status === DatasetStatus.ARCHIVED ? "Unarchive" : "Archive"}
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              disabled={!hasAccess || !!selectedVersion}
+              className="text-destructive"
+              onClick={() => {
+                if (
+                  window.confirm(
+                    "Are you sure you want to delete this item? This will also delete all run items that belong to this item.",
+                  )
+                ) {
+                  capture("dataset_item:delete");
+                  mutDelete.mutate({
                     projectId: projectId,
                     datasetId: datasetId,
                     datasetItemId: id,
-                    status:
-                      status === DatasetStatus.ARCHIVED
-                        ? DatasetStatus.ACTIVE
-                        : DatasetStatus.ARCHIVED,
-                  })
+                  });
                 }
-              >
-                <Archive className="mr-2 h-4 w-4" />
-                {status === DatasetStatus.ARCHIVED ? "Unarchive" : "Archive"}
-              </DropdownMenuItem>
-            </DropdownMenuContent>
-          </DropdownMenu>
+              }}
+            >
+              <Trash2 size="base" __rawClassName="mr-2" />
+              Delete
+            </DropdownMenuItem>
+          </>
         );
       },
-    },
+    }),
   ];
 
   const convertToTableRow = (
     item: RouterOutput["datasets"]["itemsByDatasetId"]["datasetItems"][number],
   ): RowData => {
-    let input = item.input ? JSON.stringify(item.input) : "";
-    input = input.length > 50 ? input.slice(0, 50) + "..." : input;
-    let expectedOutput = item.expectedOutput
-      ? JSON.stringify(item.expectedOutput)
-      : "";
-    expectedOutput =
-      expectedOutput.length > 50
-        ? expectedOutput.slice(0, 50) + "..."
-        : expectedOutput;
-
     return {
       id: item.id,
-      status: item.status,
-      createdAt: item.createdAt.toLocaleString(),
-      input,
-      expectedOutput,
+      source: item.sourceTraceId
+        ? {
+            traceId: item.sourceTraceId,
+            observationId: item.sourceObservationId ?? undefined,
+          }
+        : undefined,
+      status: item.status ?? "ACTIVE",
+      createdAt: item.createdAt,
+      input: item.input,
+      expectedOutput: item.expectedOutput,
+      metadata: item.metadata,
     };
   };
 
+  const [columnVisibility, setColumnVisibility] = useColumnVisibility<RowData>(
+    "datasetItemsColumnVisibility",
+    columns,
+  );
+
+  const [columnOrder, setColumnOrder] = useColumnOrder<RowData>(
+    "datasetItemsColumnOrder",
+    columns,
+  );
+
+  const batchExportButton = hasBatchExportAccess ? (
+    <BatchExportTableButton
+      key="batchExport"
+      projectId={projectId}
+      tableName={BatchExportTableName.DatasetItems}
+      orderByState={{ column: "createdAt", order: "DESC" }}
+      filterState={[
+        {
+          type: "string",
+          operator: "=",
+          column: "datasetId",
+          value: datasetId,
+        },
+      ]}
+    />
+  ) : null;
+
+  const setFilterStateWithDebounce = useDebounce(setFilterState);
+  // Below `md` the Filters sheet is the only mounted search bar. The query
+  // starts unmatched, and `hidden md:block` hides this slot until then.
+  const isMobile = useMediaQuery({ query: "(max-width: 767.98px)" });
+  const searchBar = (
+    <TableSearchBar
+      size="large"
+      key={`${projectId}:${datasetId}:${selectedVersion?.toISOString() ?? "latest"}`}
+      projectId={projectId}
+      tableName="dataset-items"
+      registry={DATASET_ITEMS_FIELD_REGISTRY}
+      filterState={filterState}
+      setFilterState={setFilterState}
+      observed={undefined}
+      isV4={false}
+      search={{
+        query: searchQuery,
+        type: searchType,
+        setQuery: setSearchQuery,
+        setType: setSearchType,
+      }}
+    />
+  );
+
   return (
-    <div>
+    <>
+      {isMobile ? null : <div className="hidden md:block">{searchBar}</div>}
+      <DataTableToolbar
+        columns={columns}
+        tableName="dataset-items"
+        isV4={false}
+        filterColumnDefinition={datasetItemFilterColumns}
+        filterState={filterState}
+        setFilterState={setFilterStateWithDebounce}
+        columnVisibility={columnVisibility}
+        setColumnVisibility={setColumnVisibility}
+        columnOrder={columnOrder}
+        setColumnOrder={setColumnOrder}
+        rowHeight={rowHeight}
+        setRowHeight={setRowHeight}
+        customRowHeight={customRowHeightMenu(rowHeights)}
+        mobileSearch={searchBar}
+        actionButtons={[menuItems, batchExportButton].filter(Boolean)}
+      />
       <DataTable
+        tableName="datasetItems"
         columns={columns}
         data={
-          items.isLoading
+          items.isPending
             ? { isLoading: true, isError: false }
             : items.isError
               ? {
@@ -188,19 +424,46 @@ export function DatasetItemsTable({
               : {
                   isLoading: false,
                   isError: false,
-                  data: items.data.datasetItems.map((t) =>
+                  data: safeExtract(items.data, "datasetItems", []).map((t) =>
                     convertToTableRow(t),
                   ),
                 }
         }
         pagination={{
-          pageCount: Math.ceil(
-            (items.data?.totalDatasetItems ?? 0) / paginationState.pageSize,
-          ),
+          totalCount: items.data?.totalDatasetItems ?? null,
           onChange: setPaginationState,
           state: paginationState,
         }}
+        columnVisibility={columnVisibility}
+        onColumnVisibilityChange={setColumnVisibility}
+        columnOrder={columnOrder}
+        onColumnOrderChange={setColumnOrder}
+        rowHeight={rowHeight}
+        customRowHeightPx={rowHeights.activeHeightPx}
+        onCustomRowHeightChange={rowHeights.setCustomPx}
+        onSelectRowHeight={setRowHeight}
       />
-    </div>
+      <EditDatasetItemDialog
+        open={editDialogOpen}
+        onOpenChange={(open) => {
+          setEditDialogOpen(open);
+          if (!open) {
+            setSelectedItemForEdit(null);
+          }
+        }}
+        projectId={projectId}
+        datasetItem={selectedItem.data ?? null}
+        dataset={
+          dataset.data
+            ? {
+                id: dataset.data.id,
+                name: dataset.data.name,
+                inputSchema: dataset.data.inputSchema ?? null,
+                expectedOutputSchema: dataset.data.expectedOutputSchema ?? null,
+              }
+            : null
+        }
+      />
+    </>
   );
 }

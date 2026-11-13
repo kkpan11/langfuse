@@ -1,150 +1,101 @@
-import { type NextApiRequest, type NextApiResponse } from "next";
-import { cors, runMiddleware } from "@/src/features/public-api/server/cors";
-import { verifyAuthHeaderAndReturnScope } from "@/src/features/public-api/server/apiAuth";
-import { v4 } from "uuid";
-import { ResourceNotFoundError } from "../../../utils/exceptions";
 import {
-  LegacySpanPatchSchema,
-  LegacySpanPostSchema,
+  PatchSpansV1Body,
+  PatchSpansV1Response,
+  PostSpansV1Body,
+  PostSpansV1Response,
+} from "@/src/features/public-api/types/spans";
+import { withMiddlewares } from "@/src/features/public-api/server/withMiddlewares";
+import { createAuthedProjectAPIRoute } from "@/src/features/public-api/server/createAuthedProjectAPIRoute";
+import { LEGACY_WRITES_DEPRECATION } from "@/src/features/public-api/server/deprecations";
+import {
+  createIngestionAttribution,
   eventTypes,
-  ingestionBatchEvent,
-} from "@/src/features/public-api/server/ingestion-api-schema";
-import {
-  handleBatch,
-  handleBatchResultLegacy,
-} from "@/src/pages/api/public/ingestion";
-import { z } from "zod";
-import { isPrismaException } from "@/src/utils/exceptions";
+  logger,
+  processEventBatch,
+} from "@langfuse/shared/src/server";
+import { v4 } from "uuid";
 
-export default async function handler(
-  req: NextApiRequest,
-  res: NextApiResponse,
-) {
-  await runMiddleware(req, res, cors);
-
-  // CHECK AUTH
-  const authCheck = await verifyAuthHeaderAndReturnScope(
-    req.headers.authorization,
-  );
-  if (!authCheck.validKey)
-    return res.status(401).json({
-      message: authCheck.error,
-    });
-  // END CHECK AUTH
-
-  if (req.method === "POST") {
-    try {
-      console.log(
-        "Trying to generate span, project ",
-        authCheck.scope.projectId,
-        ", body:",
-        JSON.stringify(req.body, null, 2),
-      );
-
-      const convertToObservation = (
-        span: z.infer<typeof LegacySpanPostSchema>,
-      ) => {
-        return {
-          ...span,
-          type: "SPAN",
-        };
-      };
-
+export default withMiddlewares({
+  POST: createAuthedProjectAPIRoute({
+    name: "Create Span (Legacy)",
+    action: "traces:create",
+    bodySchema: PostSpansV1Body,
+    responseSchema: PostSpansV1Response,
+    // Writes an observation-create event that lands in the legacy observations
+    // ClickHouse table; events_only deployments expect OTel ingestion.
+    rejectInEventsOnlyMode: true,
+    isLegacyTraceWrite: true,
+    deprecation: LEGACY_WRITES_DEPRECATION,
+    fn: async ({ body, auth, req, res }) => {
       const event = {
         id: v4(),
         type: eventTypes.OBSERVATION_CREATE,
         timestamp: new Date().toISOString(),
-        body: convertToObservation(LegacySpanPostSchema.parse(req.body)),
-      };
-
-      const result = await handleBatch(
-        ingestionBatchEvent.parse([event]),
-        {},
-        req,
-        authCheck,
-      );
-      handleBatchResultLegacy(result.errors, result.results, res);
-    } catch (error: unknown) {
-      if (isPrismaException(error)) {
-        return res.status(500).json({
-          error: "Internal Server Error",
-        });
-      }
-      if (error instanceof z.ZodError) {
-        return res.status(400).json({
-          message: "Invalid request data",
-          error: error.errors,
-        });
-      }
-      const errorMessage =
-        error instanceof Error ? error.message : "An unknown error occurred";
-      console.error(error, req.body);
-      res.status(500).json({
-        message: "Invalid request data",
-        error: errorMessage,
-      });
-    }
-  } else if (req.method === "PATCH") {
-    try {
-      console.log(
-        "Trying to update span, project ",
-        authCheck.scope.projectId,
-        ", body:",
-        JSON.stringify(req.body, null, 2),
-      );
-
-      const convertToObservation = (
-        span: z.infer<typeof LegacySpanPatchSchema>,
-      ) => {
-        return {
-          ...span,
-          id: span.spanId,
+        body: {
+          ...body,
           type: "SPAN",
-        };
+        },
       };
-
+      if (!event.body.id) {
+        event.body.id = v4();
+      }
+      const result = await processEventBatch([event], auth, {
+        attribution: createIngestionAttribution({
+          headers: req.headers,
+          authCheck: auth,
+        }),
+      });
+      if (result.errors.length > 0) {
+        const error = result.errors[0];
+        res
+          .status(error.status)
+          .json({ message: error.error ?? error.message });
+        return { id: "" }; // dummy return
+      }
+      if (result.successes.length !== 1) {
+        logger.error("Failed to create span", { result });
+        throw new Error("Failed to create span");
+      }
+      return { id: event.body.id };
+    },
+  }),
+  PATCH: createAuthedProjectAPIRoute({
+    name: "Update Span (Legacy)",
+    action: "traces:create",
+    bodySchema: PatchSpansV1Body,
+    responseSchema: PatchSpansV1Response,
+    rejectInEventsOnlyMode: true,
+    isLegacyTraceWrite: true,
+    deprecation: LEGACY_WRITES_DEPRECATION,
+    fn: async ({ body, auth, req, res }) => {
       const event = {
         id: v4(),
         type: eventTypes.OBSERVATION_UPDATE,
         timestamp: new Date().toISOString(),
-        body: convertToObservation(LegacySpanPatchSchema.parse(req.body)),
+        body: {
+          ...body,
+          id: body.spanId,
+          type: "SPAN",
+        },
       };
-
-      const result = await handleBatch(
-        ingestionBatchEvent.parse([event]),
-        {},
-        req,
-        authCheck,
-      );
-
-      handleBatchResultLegacy(result.errors, result.results, res);
-    } catch (error: unknown) {
-      console.error(error);
-
-      if (isPrismaException(error)) {
-        return res.status(500).json({
-          error: "Internal Server Error",
-        });
-      }
-      if (error instanceof z.ZodError) {
-        return res.status(400).json({
-          message: "Invalid request data",
-          error: error.errors,
-        });
-      }
-      if (error instanceof ResourceNotFoundError) {
-        return res.status(404).json({
-          message: "Span not found",
-        });
-      }
-      const errorMessage =
-        error instanceof Error ? error.message : "An unknown error occurred";
-      res.status(500).json({
-        message: "Invalid request data",
-        error: errorMessage,
+      const result = await processEventBatch([event], auth, {
+        attribution: createIngestionAttribution({
+          headers: req.headers,
+          authCheck: auth,
+        }),
       });
-    }
-  } else {
-    res.status(405).json({ message: "Method not allowed" });
-  }
-}
+      if (result.errors.length > 0) {
+        const error = result.errors[0];
+        res
+          .status(error.status)
+          .json({ message: error.error ?? error.message });
+        return { id: "" }; // dummy return
+      }
+      if (result.successes.length !== 1) {
+        logger.error("Failed to update span", { result });
+        throw new Error("Failed to update span");
+      }
+      return { id: event.body.id };
+    },
+  }),
+});

@@ -1,3 +1,5 @@
+/* eslint-disable @repo/no-style-props */
+import { Spinner } from "@/src/components/design-system/Spinner/Spinner";
 import {
   Card,
   CardHeader,
@@ -6,7 +8,6 @@ import {
   CardContent,
 } from "@/src/components/ui/card";
 import { cn } from "@/src/utils/tailwind";
-import { Loader } from "lucide-react";
 import { type ReactNode } from "react";
 
 export type DashboardCardProps = {
@@ -17,6 +18,8 @@ export type DashboardCardProps = {
   children?: ReactNode;
   headerChildren?: ReactNode;
   cardContentClassName?: string;
+  headerClassName?: string;
+  headerRight?: ReactNode;
 };
 
 export const DashboardCard = ({
@@ -27,18 +30,25 @@ export const DashboardCard = ({
   children,
   headerChildren,
   cardContentClassName,
+  headerClassName,
+  headerRight,
 }: DashboardCardProps) => {
   return (
     <Card className={cn("flex flex-col", className)}>
-      <CardHeader className="relative">
-        <CardTitle>{title}</CardTitle>
-        {description ? (
-          <CardDescription>{description}</CardDescription>
-        ) : undefined}
-        {headerChildren ?? undefined}
+      <CardHeader className={cn("relative", headerClassName)}>
+        <div className="flex justify-between">
+          <div className="flex flex-col gap-1.5">
+            <CardTitle className="text-base">{title}</CardTitle>
+            {description ? (
+              <CardDescription>{description}</CardDescription>
+            ) : undefined}
+          </div>
+          {headerRight}
+        </div>
+        {headerChildren}
         {isLoading ? (
-          <div className="absolute right-5 top-5 ">
-            <Loader className="h-5 w-5 animate-spin" />
+          <div className="absolute top-5 right-5">
+            <Spinner size="md" />
           </div>
         ) : null}
       </CardHeader>

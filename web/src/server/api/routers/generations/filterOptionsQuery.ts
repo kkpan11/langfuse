@@ -1,98 +1,173 @@
 import { z } from "zod";
 
-import { type ObservationOptions } from "@langfuse/shared";
+import {
+  ObservationType,
+  timeFilter,
+  type ObservationOptions,
+} from "@langfuse/shared";
 import { protectedProjectProcedure } from "@/src/server/api/trpc";
-import { Prisma } from "@langfuse/shared/src/db";
+import {
+  getCategoricalScoresGroupedByName,
+  getBooleanScoresGroupedByName,
+  getObservationsGroupedByModel,
+  getObservationsGroupedByModelId,
+  getObservationsGroupedByName,
+  getObservationsGroupedByPromptName,
+  getObservationsGroupedByToolName,
+  getObservationsGroupedByCalledToolName,
+  getNumericScoresGroupedByName,
+  getTracesGroupedByName,
+  getTracesGroupedByTags,
+  tracesTableUiColumnDefinitions,
+} from "@langfuse/shared/src/server";
 
 export const filterOptionsQuery = protectedProjectProcedure
-  .input(z.object({ projectId: z.string() }))
-  .query(async ({ input, ctx }) => {
-    const queryFilter = {
-      projectId: input.projectId,
-      type: "GENERATION",
-    } as const;
+  .input(
+    z.object({
+      projectId: z.string(),
+      startTimeFilter: z.array(timeFilter).optional(),
+      observationType: z
+        .union([z.enum(ObservationType), z.literal("ALL")])
+        .default("GENERATION"),
+    }),
+  )
+  .query(async ({ input }) => {
+    const { startTimeFilter } = input;
 
-    const scores = await ctx.prisma.score.groupBy({
-      where: {
-        observation: {
-          projectId: input.projectId,
-        },
-      },
-      by: ["name"],
-    });
+    // map startTimeFilter to Timestamp column for trace queries
+    const traceTimestampFilters =
+      startTimeFilter && startTimeFilter.length > 0
+        ? startTimeFilter.map((f) => ({
+            column: "Timestamp" as const,
+            operator: f.operator,
+            value: f.value,
+            type: "datetime" as const,
+          }))
+        : [];
 
-    const model = await ctx.prisma.observation.groupBy({
-      by: ["model"],
-      where: queryFilter,
-      _count: { _all: true },
-    });
-    const name = await ctx.prisma.observation.groupBy({
-      by: ["name"],
-      where: queryFilter,
-      _count: { _all: true },
-    });
-    const promptNames = await ctx.prisma.$queryRaw<
-      Array<{
-        promptName: string | null;
-        count: number;
-      }>
-    >(Prisma.sql`
-        SELECT
-          p.name "promptName",
-          count(*)::int AS count
-        FROM prompts p
-        JOIN observations o ON o.prompt_id = p.id
-        WHERE o.type = 'GENERATION'
-          AND o.project_id = ${input.projectId}
-          AND o.prompt_id IS NOT NULL
-          AND p.project_id = ${input.projectId}
-        GROUP BY 1
-      `);
-    const traceName = await ctx.prisma.$queryRaw<
-      Array<{
-        traceName: string | null;
-        count: number;
-      }>
-    >(Prisma.sql`
-        SELECT
-          t.name "traceName",
-          count(*)::int AS count
-        FROM traces t
-        JOIN observations o ON o.trace_id = t.id
-        WHERE o.type = 'GENERATION'
-          AND o.project_id = ${input.projectId}
-          AND t.project_id = ${input.projectId}
-        GROUP BY 1
-      `);
+    const getClickhouseTraceName = async (): Promise<
+      Array<{ traceName: string }>
+    > => {
+      const traces = await getTracesGroupedByName(
+        input.projectId,
+        tracesTableUiColumnDefinitions,
+        traceTimestampFilters,
+      );
+      return traces.map((i) => ({ traceName: i.name }));
+    };
+
+    const getClickhouseTraceTags = async (): Promise<
+      Array<{ tag: string }>
+    > => {
+      const traces = await getTracesGroupedByTags({
+        projectId: input.projectId,
+        filter: traceTimestampFilters,
+      });
+      return traces.map((i) => ({ tag: i.value }));
+    };
+
+    const [
+      numericScoreNames,
+      categoricalScoreNames,
+      booleanScoreNames,
+      model,
+      name,
+      promptNames,
+      traceNames,
+      tags,
+      modelId,
+      toolNames,
+      calledToolNames,
+    ] = await Promise.all([
+      // numeric scores
+      getNumericScoresGroupedByName(input.projectId, traceTimestampFilters),
+      // categorical scores
+      getCategoricalScoresGroupedByName(input.projectId, traceTimestampFilters),
+      getBooleanScoresGroupedByName(input.projectId, traceTimestampFilters),
+      //model
+      getObservationsGroupedByModel(input.projectId, startTimeFilter ?? []),
+      //name
+      getObservationsGroupedByName(
+        input.projectId,
+        startTimeFilter ?? [],
+        input.observationType === "ALL" ? null : input.observationType,
+      ),
+      //prompt name
+      getObservationsGroupedByPromptName(
+        input.projectId,
+        startTimeFilter ?? [],
+      ),
+      //trace name
+      getClickhouseTraceName(),
+      // trace tags
+      getClickhouseTraceTags(),
+      // modelId
+      getObservationsGroupedByModelId(input.projectId, startTimeFilter ?? []),
+      // available tool names (from tool_definitions)
+      getObservationsGroupedByToolName(input.projectId, startTimeFilter ?? []),
+      // called tool names (from tool_call_names)
+      getObservationsGroupedByCalledToolName(
+        input.projectId,
+        startTimeFilter ?? [],
+      ),
+    ]);
 
     // typecheck filter options, needs to include all columns with options
     const res: ObservationOptions = {
       model: model
         .filter((i) => i.model !== null)
-
+        .map((i) => ({ value: i.model as string })),
+      modelId: modelId
+        .filter((i) => i.modelId !== null)
         .map((i) => ({
-          value: i.model as string,
-          count: i._count._all,
+          value: i.modelId as string,
         })),
       name: name
         .filter((i) => i.name !== null)
-        .map((i) => ({
-          value: i.name as string,
-          count: i._count._all,
-        })),
-      traceName: traceName
+        .map((i) => ({ value: i.name as string })),
+      traceName: traceNames
         .filter((i) => i.traceName !== null)
         .map((i) => ({
           value: i.traceName as string,
-          count: i.count,
         })),
-      scores_avg: scores.map((score) => score.name),
+      scores_avg: numericScoreNames.map((score) => score.name),
+      score_categories: categoricalScoreNames,
+      score_booleans: booleanScoreNames.map((score) => score.name),
       promptName: promptNames
         .filter((i) => i.promptName !== null)
         .map((i) => ({
           value: i.promptName as string,
-          count: i.count,
         })),
+      tags: tags
+        .filter((i) => i.tag !== null)
+        .map((i) => ({
+          value: i.tag as string,
+        })),
+      toolNames: toolNames
+        .filter((i) => i.toolName !== null)
+        .map((i) => ({
+          value: i.toolName as string,
+        })),
+      calledToolNames: calledToolNames
+        .filter((i) => i.calledToolName !== null)
+        .map((i) => ({
+          value: i.calledToolName as string,
+        })),
+      type: [
+        "GENERATION",
+        "SPAN",
+        "EVENT",
+        "AGENT",
+        "TOOL",
+        "CHAIN",
+        "RETRIEVER",
+        "EVALUATOR",
+        "EMBEDDING",
+        "GUARDRAIL",
+      ].map((i) => ({
+        value: i,
+      })),
+      environment: [], // Environment is fetched separately via api.projects.environmentFilterOptions
     };
 
     return res;

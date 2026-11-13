@@ -1,19 +1,35 @@
+/* eslint-disable no-nested-ternary */
 import {
   type FilterState,
   type TableName,
   observationsTableCols,
   tracesTableCols,
   singleFilter,
+  sessionsViewCols,
+  promptsTableCols,
+  datasetRunsTableCols,
+  datasetItemFilterColumns,
+  datasetRunItemsTableCols,
+  usersTableCols,
+  escapePipeInValue,
+  splitOnUnescapedPipe,
+  unescapePipeInValue,
+  normalizeLegacySessionPositionInTraceKey,
+  scoresTableCols,
 } from "@langfuse/shared";
-import { scoresTableCols } from "@/src/server/api/definitions/scoresTable";
-import { sessionsViewCols } from "@/src/server/api/definitions/sessionsView";
-import { useState } from "react";
+
 import {
   useQueryParam,
   encodeDelimitedArray,
   decodeDelimitedArray,
   withDefault,
 } from "use-query-params";
+import useSessionStorage from "@/src/components/useSessionStorage";
+import { evalConfigFilterColumns } from "@/src/server/api/definitions/evalConfigsTable";
+import { evalExecutionsFilterCols } from "@/src/server/api/definitions/evalExecutionsTable";
+import { experimentsTableCols } from "@/src/features/experiments/components/table/filter-config";
+import { experimentItemsTableCols } from "@/src/features/experiments/config/experiment-items-filter-config";
+import { usePeekTableState } from "@/src/components/table/peek/contexts/PeekTableStateProvider";
 
 const DEBUG_QUERY_STATE = false;
 
@@ -23,24 +39,40 @@ const DEBUG_QUERY_STATE = false;
 const getCommaArrayParam = (table: TableName) => ({
   encode: (filterState: FilterState) =>
     encodeDelimitedArray(
-      filterState.map((f) => {
-        const columnId = getColumnId(table, f.column);
+      filterState
+        .map((f) => {
+          const columnId = getColumnId(table, f.column);
 
-        const stringified = `${columnId};${f.type};${
-          f.type === "numberObject" || f.type === "stringObject" ? f.key : ""
-        };${f.operator};${encodeURIComponent(
-          f.type === "datetime"
-            ? f.value.toISOString()
-            : f.type === "stringOptions"
-              ? f.value.join("|")
-              : f.type === "arrayOptions"
-                ? f.value.join("|")
-                : f.value,
-        )}`;
-        // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
-        if (DEBUG_QUERY_STATE) console.log("stringified", stringified);
-        return stringified;
-      }),
+          if (!columnId) {
+            return null;
+          }
+
+          const stringified = `${columnId};${f.type};${
+            f.type === "numberObject" ||
+            f.type === "stringObject" ||
+            f.type === "booleanObject" ||
+            f.type === "categoryOptions" ||
+            f.type === "positionInTrace"
+              ? encodeURIComponent(f.key ?? "")
+              : ""
+          };${f.operator};${encodeURIComponent(
+            f.type === "datetime"
+              ? new Date(f.value).toISOString()
+              : f.type === "stringOptions" ||
+                  f.type === "arrayOptions" ||
+                  f.type === "categoryOptions"
+                ? (f.value as string[]).map(escapePipeInValue).join("|")
+                : f.type === "positionInTrace"
+                  ? f.value === undefined || f.value === null
+                    ? ""
+                    : f.value
+                  : f.value,
+          )}`;
+
+          if (DEBUG_QUERY_STATE) console.log("stringified", stringified);
+          return stringified;
+        })
+        .filter((s): s is string => s !== null),
       ",",
     ),
 
@@ -49,29 +81,51 @@ const getCommaArrayParam = (table: TableName) => ({
       ?.map((f) => {
         if (!f) return null;
         const [column, type, key, operator, value] = f.split(";");
-        // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+
         if (DEBUG_QUERY_STATE)
           console.log("values", [column, type, key, operator, value]);
-        const decodedValue = value ? decodeURIComponent(value) : undefined;
-        const parsedValue =
-          decodedValue === undefined || type === undefined
-            ? undefined
-            : type === "datetime"
-              ? new Date(decodedValue)
-              : type === "number" || type === "numberObject"
-                ? Number(decodedValue)
-                : type === "stringOptions"
-                  ? decodedValue.split("|")
-                  : type === "arrayOptions"
-                    ? decodedValue.split("|")
-                    : type === "boolean"
-                      ? decodedValue === "true"
-                      : decodedValue;
-        // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+        const decodedValue =
+          value !== undefined ? decodeURIComponent(value) : undefined;
+        const normalizedKey =
+          type === "positionInTrace"
+            ? normalizeLegacySessionPositionInTraceKey(decodeObjectKey(key))
+            : decodeObjectKey(key);
+        const parsedValue = (() => {
+          if (decodedValue === undefined || type === undefined) {
+            return undefined;
+          }
+          if (type === "datetime") {
+            return new Date(decodedValue);
+          }
+          if (type === "number" || type === "numberObject") {
+            return Number(decodedValue);
+          }
+          if (type === "positionInTrace") {
+            if (decodedValue === "") {
+              return undefined;
+            }
+            return Number(decodedValue);
+          }
+          if (type === "arrayOptions" && decodedValue === "") {
+            return [];
+          }
+          if (
+            type === "stringOptions" ||
+            type === "arrayOptions" ||
+            type === "categoryOptions"
+          ) {
+            return splitOnUnescapedPipe(decodedValue).map(unescapePipeInValue);
+          }
+          if (type === "boolean" || type === "booleanObject") {
+            return decodedValue === "true";
+          }
+          return decodedValue;
+        })();
+
         if (DEBUG_QUERY_STATE) console.log("parsedValue", parsedValue);
         const parsed = singleFilter.safeParse({
           column: getColumnName(table, column),
-          key: key !== "" ? key : undefined,
+          key: normalizedKey !== "" ? normalizedKey : undefined,
           operator,
           value: parsedValue,
           type,
@@ -86,18 +140,54 @@ const getCommaArrayParam = (table: TableName) => ({
 export const useQueryFilterState = (
   initialState: FilterState = [],
   table: TableName,
+  projectId?: string, // Passing projectId is expected as filters might differ across projects. However, we can't call hooks conditionally. There is a case in the prompts table where this will only be used if projectId is defined, but it's not defined in all cases.
 ) => {
-  const [filterState, setFilterState] = useQueryParam(
-    "filter",
-    withDefault(getCommaArrayParam(table), initialState),
+  const peekContext = usePeekTableState();
+
+  const [sessionFilterState, setSessionFilterState] =
+    useSessionStorage<FilterState>(
+      !!projectId ? `${table}FilterState-${projectId}` : `${table}FilterState`,
+      initialState,
+    );
+  // Merge initial state with session state if filter elements don't exist
+  const mergedInitialState = initialState.reduce(
+    (acc, filter) => {
+      const exists = sessionFilterState.some((f) => f.column === filter.column);
+      if (!exists) {
+        acc.push(filter);
+      }
+      return acc;
+    },
+    [...sessionFilterState],
   );
 
-  return [filterState, setFilterState] as const;
-};
+  // Update session storage with merged state
+  if (mergedInitialState.length !== sessionFilterState.length) {
+    setSessionFilterState(mergedInitialState);
+  }
 
-export const useMemoryFilterState = (initialState: FilterState = []) => {
-  const [filterState, setFilterState] = useState(initialState);
-  return [filterState, setFilterState] as const;
+  // Note: `use-query-params` library does not automatically update the URL with the default value
+  const [filterState, setFilterState] = useQueryParam(
+    "filter",
+    withDefault(getCommaArrayParam(table), sessionFilterState),
+  );
+
+  if (peekContext) {
+    const setState = (newFilters: FilterState) => {
+      peekContext.setTableState({
+        ...peekContext.tableState,
+        filters: newFilters,
+      });
+    };
+    return [peekContext.tableState.filters, setState] as const;
+  }
+
+  const setFilterStateWithSession = (newState: FilterState): void => {
+    setFilterState(newState);
+    setSessionFilterState(newState);
+  };
+
+  return [filterState, setFilterStateWithSession] as const;
 };
 
 const tableCols = {
@@ -105,13 +195,50 @@ const tableCols = {
   traces: tracesTableCols,
   sessions: sessionsViewCols,
   scores: scoresTableCols,
-  dashboard: [{ id: "traceName", name: "traceName" }],
+  prompts: promptsTableCols,
+  users: usersTableCols,
+  eval_configs: evalConfigFilterColumns,
+  job_executions: evalExecutionsFilterCols,
+  dataset_items: datasetItemFilterColumns,
+  dataset_runs: datasetRunsTableCols,
+  dataset_run_items_by_run: datasetRunItemsTableCols,
+  experiments: experimentsTableCols,
+  "experiment-items": experimentItemsTableCols,
+  widgets: [
+    { id: "environment", name: "Environment" },
+    { id: "traceName", name: "Trace Name" },
+    { id: "tags", name: "Tags" },
+    { id: "release", name: "Release" },
+    { id: "user", name: "User" },
+    { id: "session", name: "Session" },
+    { id: "version", name: "Version" },
+  ],
+  dashboard: [
+    { id: "traceName", name: "Trace Name" },
+    { id: "tags", name: "Tags" },
+    { id: "release", name: "Release" },
+    { id: "user", name: "User" },
+    { id: "version", name: "Version" },
+  ],
 };
 
 function getColumnId(table: TableName, name: string): string | undefined {
-  return tableCols[table]?.find((col) => col.name === name)?.id;
+  // TODO: make this more robust, will change with new filters
+  // to give more leeway to LLMs, we check against name or id
+  return tableCols[table]?.find((col) => col.name === name || col.id === name)
+    ?.id;
 }
 
 function getColumnName(table: TableName, id: string): string | undefined {
   return tableCols[table]?.find((col) => col.id === id)?.name;
+}
+
+/** decodeObjectKey percent-decodes a filter key, keeping keys from older raw links as written */
+function decodeObjectKey(key: string | undefined): string | undefined {
+  if (key === undefined) return undefined;
+  try {
+    return decodeURIComponent(key);
+  } catch {
+    return key;
+  }
 }

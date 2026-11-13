@@ -1,79 +1,84 @@
 import { z } from "zod";
-import { extractVariables } from "@/src/utils/string";
-import { PromptType } from "@/src/features/prompts/server/validation";
-import { ChatMessageRole } from "@langfuse/shared";
-
-const ChatMessageSchema = z.object({
-  role: z.nativeEnum(ChatMessageRole),
-  content: z.string(),
-});
-
-export const ChatMessageListSchema = z.array(ChatMessageSchema);
-export const TextPromptSchema = z
-  .string()
-  .min(1, "Enter a prompt")
-  .refine(
-    validateVariables,
-    "Variables must only contain letters and underscores (_)",
-  );
+import {
+  ChatMessageType,
+  PlaceholderMessageSchema,
+  PromptChatMessageListSchema,
+  PromptNameSchema,
+  TextPromptContentSchema,
+  COMMIT_MESSAGE_MAX_LENGTH,
+  PromptType,
+} from "@langfuse/shared";
 
 const NewPromptBaseSchema = z.object({
-  name: z.string().min(1, "Enter a name"),
+  name: PromptNameSchema,
   isActive: z.boolean({
-    required_error: "Enter whether the prompt should go live",
+    error: "Enter whether the prompt should go live",
   }),
   config: z.string().refine(validateJson, "Config needs to be valid JSON"),
+  commitMessage: z
+    .string()
+    .trim()
+    .max(COMMIT_MESSAGE_MAX_LENGTH)
+    .transform((val) => (val === "" ? undefined : val))
+    .optional(),
 });
 
 const NewChatPromptSchema = NewPromptBaseSchema.extend({
   type: z.literal(PromptType.Chat),
-  chatPrompt: ChatMessageListSchema.refine(
-    (messages) => messages.every((message) => message.content.length > 0),
-    "Enter a chat message or remove the empty message",
-  ).refine(
-    (messages) => validateVariables(messages.map((m) => m.content).join("\n")),
-    "Variables must only contain letters and underscores (_)",
-  ),
+  chatPrompt: z
+    .array(z.any())
+    .refine(
+      (messages: Array<{ type?: ChatMessageType; content?: string }>) =>
+        messages.every((message) => {
+          const isPlaceholder = message?.type === ChatMessageType.Placeholder;
+          return (
+            !isPlaceholder ||
+            PlaceholderMessageSchema.safeParse(message).success
+          );
+        }),
+      "Placeholder name must start with a letter and contain only alphanumeric characters and underscores",
+    )
+    .refine(
+      (messages: Array<{ type?: ChatMessageType; content?: string }>) =>
+        messages.every((message) => {
+          const isPlaceholder = message?.type === ChatMessageType.Placeholder;
+          return isPlaceholder || Boolean(message?.content?.trim()?.length);
+        }),
+      "Enter a chat message or remove the empty message",
+    ),
   textPrompt: z.string(),
 });
 
 const NewTextPromptSchema = NewPromptBaseSchema.extend({
   type: z.literal(PromptType.Text),
   chatPrompt: z.array(z.any()),
-  textPrompt: TextPromptSchema,
+  textPrompt: TextPromptContentSchema,
 });
 
-export const NewPromptFormSchema = z.union([
+export const NewPromptFormSchema = z.discriminatedUnion("type", [
   NewChatPromptSchema,
   NewTextPromptSchema,
 ]);
 export type NewPromptFormSchemaType = z.infer<typeof NewPromptFormSchema>;
 
-export const PromptContentSchema = z.union([
+export const PromptVariantSchema = z.union([
   z.object({
     type: z.literal(PromptType.Chat),
-    prompt: ChatMessageListSchema,
+    prompt: PromptChatMessageListSchema,
   }),
   z.object({
     type: z.literal(PromptType.Text),
     prompt: z.string(),
   }),
 ]);
-export type PromptContentType = z.infer<typeof PromptContentSchema>;
-
-function validateVariables(content: string): boolean {
-  const variables = extractVariables(content);
-  const charOrUnderscore = /^[A-Za-z_]+$/;
-
-  return variables.every((variable) => charOrUnderscore.test(variable));
-}
+export type PromptVariant = z.infer<typeof PromptVariantSchema>;
 
 function validateJson(content: string): boolean {
   try {
     JSON.parse(content);
 
     return true;
-  } catch (e) {
+  } catch (_e) {
     return false;
   }
 }

@@ -1,5 +1,5 @@
+/* eslint-disable @repo/no-style-props */
 import { cn } from "@/src/utils/tailwind";
-import { Flex, Metric, Text } from "@tremor/react";
 import { type ReactNode } from "react";
 
 export const TotalMetric = ({
@@ -14,14 +14,16 @@ export const TotalMetric = ({
   children?: ReactNode;
 }) => {
   return (
-    <Flex
-      justifyContent="start"
-      alignItems="baseline"
-      className={cn("space-x-2 animate-in", className)}
-    >
-      <Metric>{metric}</Metric>
-      <Text>{description}</Text>
-      {children}
-    </Flex>
+    <div className={cn("animate-in flex flex-col items-start", className)}>
+      <div className="text-3xl font-bold">{metric}</div>
+      {description || children ? (
+        <div className="flex min-w-0 items-center gap-1">
+          {description ? (
+            <p className="text-muted-foreground text-sm">{description}</p>
+          ) : null}
+          {children}
+        </div>
+      ) : null}
+    </div>
   );
 };

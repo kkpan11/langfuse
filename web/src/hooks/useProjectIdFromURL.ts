@@ -1,11 +1,8 @@
 import { useRouter } from "next/router";
+import { asSingleQueryParam } from "@/src/hooks/useReadyRouteParams";
 
 export default function useProjectIdFromURL() {
   const router = useRouter();
 
-  if (!router.query.projectId) {
-    throw new Error("useProjectId must be used within a project route");
-  }
-
-  return router.query.projectId as string;
+  return asSingleQueryParam(router.query.projectId);
 }

@@ -1,40 +1,58 @@
-import {
-  type AuthHeaderVerificationResult,
-  verifyAuthHeaderAndReturnScope,
-} from "@/src/features/public-api/server/apiAuth";
 import { cors, runMiddleware } from "@/src/features/public-api/server/cors";
-import { prisma } from "@langfuse/shared/src/db";
 import { type NextApiRequest, type NextApiResponse } from "next";
 import { z } from "zod";
 import {
-  type ingestionApiSchema,
+  traceException,
+  logger,
+  getCurrentSpan,
+  contextWithLangfuseProps,
   eventTypes,
-  ingestionEvent,
-} from "@/src/features/public-api/server/ingestion-api-schema";
-import { type ApiAccessScope } from "@/src/features/public-api/server/types";
-import { persistEventMiddleware } from "@/src/server/api/services/event-service";
-import { backOff } from "exponential-backoff";
-import { ResourceNotFoundError } from "@/src/utils/exceptions";
-import {
-  SdkLogProcessor,
-  type EventProcessor,
-  TraceProcessor,
-} from "../../../server/api/services/EventProcessor";
-import { ObservationProcessor } from "../../../server/api/services/EventProcessor";
-import { ScoreProcessor } from "../../../server/api/services/EventProcessor";
-import { isNotNullOrUndefined } from "@/src/utils/types";
+  markProjectIngestFailure,
+  createIngestionAttribution,
+  processEventBatch,
+  type ApiAccessLevel,
+  redactLangfuseSecretKeys,
+} from "@langfuse/shared/src/server";
 import { telemetry } from "@/src/features/telemetry";
-import { jsonSchema } from "@/src/utils/zod";
-import * as Sentry from "@sentry/nextjs";
-import { isPrismaException } from "@/src/utils/exceptions";
-import { env } from "@/src/env.mjs";
+import { clickHouseRouteForRequest } from "@/src/features/public-api/server/clickHouseRequestTags";
 import {
-  ValidationError,
+  jsonSchema,
   MethodNotAllowedError,
   BaseError,
+  InternalServerError,
   ForbiddenError,
-  UnauthorizedError,
-} from "@/src/server/errors";
+} from "@langfuse/shared";
+import { isPrismaException } from "@/src/utils/exceptions";
+import { RateLimitService } from "@/src/features/public-api/server/RateLimitService";
+import { setRetryAfterHeader } from "@/src/features/public-api/server/writeError";
+import * as opentelemetry from "@opentelemetry/api";
+import { env } from "@/src/env.mjs";
+import {
+  attachDeprecation,
+  EVENTS_ONLY_INGESTION_REMEDIATION,
+  INGESTION_DEPRECATION,
+  LEGACY_INGESTION_ORG_CUTOFF_MESSAGE,
+  setDeprecationHeaders,
+} from "@/src/features/public-api/server/deprecations";
+import {
+  SDK_NAME_ATTRIBUTE,
+  SDK_VERSION_ATTRIBUTE,
+  extractSdkAttributes,
+} from "@langfuse/shared/instrumentation/bootstrap";
+import {
+  shadowAuth,
+  shadowAuthorize,
+} from "@/src/features/public-api/server/shadowAuth";
+import { __dangerouslySkipAuthz } from "@/src/features/public-api/server/enforceAuth";
+import { type ProjectAction } from "@langfuse/shared/rbac";
+import {
+  unauthorizedError,
+  type AuthorizationContext,
+} from "@/src/features/auth/policy/types";
+import {
+  isLegacyIngestionScoreOnlyOrg,
+  recordLegacyIngestionScoreOnlyRejection,
+} from "@/src/features/public-api/server/legacyIngestionScoreOnlyCutoff";
 
 export const config = {
   api: {
@@ -44,106 +62,249 @@ export const config = {
   },
 };
 
-type BatchResult = {
-  result: unknown;
-  id: string;
-  type: string;
-};
-
+/**
+ * This handler performs multiple actions to ingest data. It is compatible with the new async workflow, but also
+ * supports the old synchronous workflow which processes events in the web container.
+ * Overall, the processing of each incoming request happens in three stages
+ * 1. Validation
+ *   - Check that the user has permissions
+ *   - Check whether rate-limits are breached
+ *   - Check that the request is well-formed
+ * 2. Async Processing
+ *   - Upload each event to S3 for long-term storage and as an event cache
+ *   - Add the event batch to the queue for async processing
+ *   - Fallback to sync processing on errors
+ * 3. Sync Processing
+ * The last two stages live in a processEventBatch function which is reused for the POST scores endpoint and for
+ * legacy event types.
+ */
 export default async function handler(
   req: NextApiRequest,
   res: NextApiResponse,
 ) {
+  let projectIdForIngestFailure: string | undefined;
+
   try {
     await runMiddleware(req, res, cors);
 
-    if (req.method !== "POST") throw new MethodNotAllowedError();
+    // add context of api call to the span
+    const currentSpan = getCurrentSpan();
 
-    // CHECK AUTH FOR ALL EVENTS
-    const authCheck = await verifyAuthHeaderAndReturnScope(
-      req.headers.authorization,
-    );
-
-    if (!authCheck.validKey) throw new UnauthorizedError(authCheck.error);
-
-    const batchType = z.object({
-      batch: z.array(z.unknown()),
-      metadata: jsonSchema.nullish(),
+    // Preserve the raw x-langfuse-* attributes consumed by existing ingestion
+    // dashboards. The canonical attributes below are shared by all public API
+    // routes and intentionally use a bounded SDK name/version vocabulary.
+    Object.keys(req.headers).forEach((header) => {
+      if (
+        header.toLowerCase().startsWith("x-langfuse") ||
+        header.toLowerCase().startsWith("x_langfuse")
+      ) {
+        const value = req.headers[header];
+        if (value === undefined) return;
+        currentSpan?.setAttributes({
+          [`langfuse.header.${header.slice(11).toLowerCase().replaceAll("_", "-")}`]:
+            Array.isArray(value)
+              ? value.map(redactLangfuseSecretKeys)
+              : redactLangfuseSecretKeys(value),
+        });
+      }
     });
 
-    const parsedSchema = batchType.safeParse(req.body);
-
-    if (!parsedSchema.success) {
-      console.log("Invalid request data", parsedSchema.error);
-      return res.status(400).json({
-        message: "Invalid request data",
-        errors: parsedSchema.error.issues.map((issue) => issue.message),
-      });
+    const { sdkName, sdkVersion } = extractSdkAttributes(req.headers);
+    if (sdkName) {
+      currentSpan?.setAttribute(SDK_NAME_ATTRIBUTE, sdkName);
+    }
+    if (sdkVersion) {
+      currentSpan?.setAttribute(SDK_VERSION_ATTRIBUTE, sdkVersion);
     }
 
-    const validationErrors: { id: string; error: unknown }[] = [];
+    if (req.method !== "POST") throw new MethodNotAllowedError();
 
-    const batch: (z.infer<typeof ingestionEvent> | undefined)[] =
-      parsedSchema.data.batch.map((event) => {
-        const parsed = ingestionEvent.safeParse(event);
-        if (!parsed.success) {
-          validationErrors.push({
-            id:
-              typeof event === "object" && event && "id" in event
-                ? typeof event.id === "string"
-                  ? event.id
-                  : "unknown"
-                : "unknown",
-            error: new ValidationError(parsed.error.message),
-          });
-          return undefined;
-        } else {
-          return parsed.data;
-        }
-      });
-    const filteredBatch: z.infer<typeof ingestionEvent>[] =
-      batch.filter(isNotNullOrUndefined);
-
-    await telemetry();
-
-    const sortedBatch = sortBatch(filteredBatch);
-    const result = await handleBatch(
-      sortedBatch,
-      parsedSchema.data.metadata,
+    // CHECK AUTH FOR ALL EVENTS; each event authorizes its own action below.
+    const authResult = await shadowAuth({
       req,
-      authCheck,
-    );
+      action: __dangerouslySkipAuthz,
+      allowedAccessLevels: ["project", "scores"],
+    });
+    if (!authResult.success) throw authResult.error;
+    const { scope, ctx: authCtx } = authResult;
+    // shadowAuth's project/scores gating guarantees a projectId; narrow the invariant.
+    if (!scope.projectId) {
+      throw new InternalServerError("Missing projectId on an authorized scope");
+    }
+    const projectId = scope.projectId;
+    projectIdForIngestFailure = projectId;
+    if (scope.isIngestionSuspended) {
+      throw new ForbiddenError(
+        "Ingestion suspended: Usage threshold exceeded. Please upgrade your plan.",
+      );
+    }
+    const authCheck = { validKey: true as const, scope };
 
-    // send out REST requests to worker for all trace types
-    await sendToWorkerIfEnvironmentConfigured(
-      result.results,
-      authCheck.scope.projectId,
-    );
+    const ctx = contextWithLangfuseProps({
+      headers: req.headers,
+      projectId,
+      apiKeyId: authCheck.scope.apiKeyId,
+      clickhouse: {
+        surface: "publicapi",
+        route: clickHouseRouteForRequest(req),
+      },
+    });
+    // Execute the rest of the handler within the context. Await so rejections
+    // reach the outer catch, which maps BaseErrors (e.g. 503 + Retry-After).
+    return await opentelemetry.context.with(ctx, async () => {
+      try {
+        try {
+          const rateLimitCheck =
+            await RateLimitService.getInstance().rateLimitRequest(
+              authCheck.scope,
+              "ingestion",
+            );
 
-    handleBatchResult(
-      [...validationErrors, ...result.errors],
-      result.results,
-      res,
-    );
+          if (rateLimitCheck?.isRateLimited()) {
+            return rateLimitCheck.sendRestResponseIfLimited(res);
+          }
+        } catch (e) {
+          // If rate-limiter returns an error, we log it and continue processing.
+          // This allows us to fail open instead of reject requests.
+          logger.error("Error while rate limiting", e);
+        }
+
+        const batchType = z.object({
+          batch: z.array(z.unknown()),
+          metadata: jsonSchema.nullish(),
+        });
+
+        const parsedSchema = batchType.safeParse(req.body);
+
+        if (!parsedSchema.success) {
+          logger.info("Invalid request data", parsedSchema.error);
+          return res.status(400).json({
+            message: "Invalid request data",
+            errors: parsedSchema.error.issues.map((issue) => issue.message),
+          });
+        }
+
+        await telemetry();
+
+        // V4 events_only mode: refuse every non-score event because trace and
+        // observation writes target legacy ClickHouse tables this deployment
+        // no longer reads. Organizations created at or after the cutoff get the
+        // same allow-list. SDK logs are refused too. Reject per-event so a
+        // mixed batch still processes its score events.
+        const isEventsOnlyMode =
+          env.LANGFUSE_MIGRATION_V4_WRITE_MODE === "events_only";
+        const scoreOnlyReason = scoreOnlyReasonFor(
+          isEventsOnlyMode,
+          scope.organizationCreatedAt,
+        );
+        const { batchForProcessing, rejectedErrors } = filterBatchForEventsOnly(
+          parsedSchema.data.batch,
+          scoreOnlyReason,
+        );
+        if (scoreOnlyReason === "org_cutoff") {
+          recordLegacyIngestionScoreOnlyRejection({
+            route: "POST /api/public/ingestion",
+            count: rejectedErrors.length,
+            orgId: scope.orgId,
+            projectId,
+          });
+        }
+
+        const attribution = createIngestionAttribution({
+          headers: req.headers,
+          authCheck,
+        });
+
+        if (isEventsOnlyMode && rejectedErrors.length > 0) {
+          logger.warn(
+            `Rejected ${rejectedErrors.length} event(s) from the legacy /api/public/ingestion endpoint for project ${projectId} because this Langfuse v4 deployment runs in events_only mode. These events were not stored. ${EVENTS_ONLY_INGESTION_REMEDIATION}`,
+            {
+              sdkName: attribution.ingestionSdkName,
+              sdkVersion: attribution.ingestionSdkVersion,
+            },
+          );
+        }
+
+        const authorized = authorizeIngestionBatch(
+          batchForProcessing,
+          authCtx,
+          scope.accessLevel,
+          projectId,
+        );
+
+        const result = await processEventBatch(
+          authorized.batchForProcessing,
+          authCheck,
+          { attribution },
+        );
+        result.errors = [
+          ...result.errors,
+          ...rejectedErrors,
+          ...authorized.rejectedErrors,
+        ];
+
+        // Cloud-only: a 207 with every event 201 is how agents conclude the
+        // legacy write path is healthy. Stamp when the original batch asked
+        // to write a trace or observation, including events_only rejections.
+        const deprecation =
+          env.NEXT_PUBLIC_LANGFUSE_CLOUD_REGION &&
+          batchContainsTraceOrObservationEvent(parsedSchema.data.batch)
+            ? INGESTION_DEPRECATION
+            : undefined;
+
+        if (deprecation) setDeprecationHeaders(res, deprecation);
+        return res.status(207).json(attachDeprecation(result, deprecation));
+      } catch (error) {
+        if (!(error instanceof BaseError && error.isUserError())) {
+          markProjectIngestFailure(projectId, {
+            source: "public_ingestion_api",
+            reason: "api_internal_error",
+          });
+        }
+        throw error;
+      }
+    });
   } catch (error: unknown) {
-    console.error(error);
-
     if (error instanceof BaseError) {
+      if (!error.isUserError()) {
+        logger.error(error);
+        traceException(error);
+        if (projectIdForIngestFailure) {
+          markProjectIngestFailure(projectIdForIngestFailure, {
+            source: "public_ingestion_api",
+            reason: "api_internal_error",
+          });
+        }
+      }
+
+      setRetryAfterHeader(res, error);
       return res.status(error.httpCode).json({
         error: error.name,
         message: error.message,
       });
     }
 
+    if (error instanceof z.ZodError) {
+      logger.error(`Zod exception`, error.issues);
+      return res.status(400).json({
+        message: "Invalid request data",
+        error: error.issues,
+      });
+    }
+
+    logger.error("error_handling_ingestion_event", error);
+    traceException(error);
+
+    if (projectIdForIngestFailure) {
+      markProjectIngestFailure(projectIdForIngestFailure, {
+        source: "public_ingestion_api",
+        reason: "api_internal_error",
+      });
+    }
+
     if (isPrismaException(error)) {
       return res.status(500).json({
         error: "Internal Server Error",
-      });
-    }
-    if (error instanceof z.ZodError) {
-      return res.status(400).json({
-        message: "Invalid request data",
-        error: error.errors,
       });
     }
 
@@ -156,301 +317,160 @@ export default async function handler(
   }
 }
 
-const sortBatch = (batch: Array<z.infer<typeof ingestionEvent>>) => {
-  // keep the order of events as they are. Order events in a way that types containing updates come last
-  // Filter out OBSERVATION_UPDATE events
-  const updates = batch.filter(
-    (event) => event.type === eventTypes.OBSERVATION_UPDATE,
-  );
+// Scores keep their own ClickHouse table and are the only event type accepted
+// by this endpoint in V4 events_only mode and for cutoff organizations.
+const EVENTS_ONLY_ALLOWED_TYPES = new Set<string>([eventTypes.SCORE_CREATE]);
 
-  // Keep all other events in their original order
-  const others = batch.filter(
-    (event) => event.type !== eventTypes.OBSERVATION_UPDATE,
-  );
+const TRACE_OR_OBSERVATION_EVENT_TYPES = new Set<string>(
+  Object.values(eventTypes).filter(
+    (type) =>
+      type !== eventTypes.SCORE_CREATE &&
+      type !== eventTypes.SDK_LOG &&
+      type !== eventTypes.DATASET_RUN_ITEM_CREATE,
+  ),
+);
 
-  // Return the array with non-update events first, followed by update events
-  return [...others, ...updates];
+/** ScoreOnlyReason is why this request may only ingest scores; it picks the rejection text. */
+type ScoreOnlyReason = "events_only" | "org_cutoff";
+
+const SCORE_ONLY_REJECTION: Record<ScoreOnlyReason, string> = {
+  events_only: `is not accepted by /api/public/ingestion when LANGFUSE_MIGRATION_V4_WRITE_MODE is events_only. This endpoint only accepts score events. ${EVENTS_ONLY_INGESTION_REMEDIATION}`,
+  org_cutoff: `is not accepted. ${LEGACY_INGESTION_ORG_CUTOFF_MESSAGE}`,
 };
 
-export const handleBatch = async (
-  events: z.infer<typeof ingestionApiSchema>["batch"],
-  metadata: z.infer<typeof ingestionApiSchema>["metadata"],
-  req: NextApiRequest,
-  authCheck: AuthHeaderVerificationResult,
-) => {
-  console.log("handling ingestion event", JSON.stringify(events, null, 2));
-
-  if (!authCheck.validKey) throw new UnauthorizedError(authCheck.error);
-
-  const results: BatchResult[] = []; // Array to store the results
-
-  const errors: {
-    error: unknown;
-    id: string;
-    type: string;
-  }[] = []; // Array to store the errors
-
-  for (const singleEvent of events) {
-    try {
-      const result = await retry(async () => {
-        return await handleSingleEvent(
-          singleEvent,
-          metadata,
-          req,
-          authCheck.scope,
-        );
-      });
-      results.push({
-        result: result,
-        id: singleEvent.id,
-        type: singleEvent.type,
-      }); // Push each result into the array
-    } catch (error) {
-      // Handle or log the error if `handleSingleEvent` fails
-      console.error("Error handling event:", error);
-      // Decide how to handle the error: rethrow, continue, or push an error object to results
-      // For example, push an error object:
-      errors.push({ error: error, id: singleEvent.id, type: singleEvent.type });
-    }
-  }
-
-  return { results, errors };
-};
-
-async function retry<T>(request: () => Promise<T>): Promise<T> {
-  return await backOff(request, {
-    numOfAttempts: 3,
-    retry: (e: Error, attemptNumber: number) => {
-      if (e instanceof UnauthorizedError || e instanceof ForbiddenError) {
-        console.log("not retrying auth error");
-        return false;
-      }
-      console.log(`retrying processing events ${attemptNumber}`);
-      return true;
-    },
-  });
+function scoreOnlyReasonFor(
+  isEventsOnlyMode: boolean,
+  organizationCreatedAt: string | null | undefined,
+): ScoreOnlyReason | null {
+  if (isEventsOnlyMode) return "events_only";
+  if (isLegacyIngestionScoreOnlyOrg(organizationCreatedAt)) return "org_cutoff";
+  return null;
 }
-export const getBadRequestError = (errors: Array<unknown>): ValidationError[] =>
-  errors.filter(
-    (error): error is ValidationError => error instanceof ValidationError,
-  );
 
-export const getResourceNotFoundError = (
-  errors: Array<unknown>,
-): ResourceNotFoundError[] =>
-  errors.filter(
-    (error): error is ResourceNotFoundError =>
-      error instanceof ResourceNotFoundError,
-  );
-
-export const hasBadRequestError = (errors: Array<unknown>) =>
-  errors.some((error) => error instanceof ValidationError);
-
-const handleSingleEvent = async (
-  event: z.infer<typeof ingestionEvent>,
-  metadata: z.infer<typeof ingestionApiSchema>["metadata"],
-  req: NextApiRequest,
-  apiScope: ApiAccessScope,
-) => {
-  console.log(
-    `handling single event ${event.id}`,
-    JSON.stringify(event, null, 2),
-  );
-
-  const cleanedEvent = ingestionEvent.parse(cleanEvent(event));
-
-  const { type } = cleanedEvent;
-
-  await persistEventMiddleware(
-    prisma,
-    apiScope.projectId,
-    req,
-    cleanedEvent,
-    metadata,
-  );
-
-  let processor: EventProcessor;
-  switch (type) {
-    case eventTypes.TRACE_CREATE:
-      processor = new TraceProcessor(cleanedEvent);
-      break;
-    case eventTypes.OBSERVATION_CREATE:
-    case eventTypes.OBSERVATION_UPDATE:
-    case eventTypes.EVENT_CREATE:
-    case eventTypes.SPAN_CREATE:
-    case eventTypes.SPAN_UPDATE:
-    case eventTypes.GENERATION_CREATE:
-    case eventTypes.GENERATION_UPDATE:
-      processor = new ObservationProcessor(cleanedEvent);
-      break;
-    case eventTypes.SCORE_CREATE: {
-      processor = new ScoreProcessor(cleanedEvent);
-      break;
-    }
-    case eventTypes.SDK_LOG:
-      processor = new SdkLogProcessor(cleanedEvent);
+export function filterBatchForEventsOnly(
+  batch: unknown[],
+  scoreOnlyReason: ScoreOnlyReason | null,
+): IngestionBatchFilter {
+  if (!scoreOnlyReason) {
+    return { batchForProcessing: batch, rejectedErrors: [] };
   }
 
-  // Deny access to non-score events if the access level is not "all"
-  // This is an additional safeguard to auth checks in EventProcessor
-  if (apiScope.accessLevel !== "all" && type !== eventTypes.SCORE_CREATE) {
-    throw new ForbiddenError("Access denied. Event type not allowed.");
-  }
+  const batchForProcessing: unknown[] = [];
+  const rejectedErrors: IngestionEventRejection[] = [];
 
-  return await processor.process(apiScope);
-};
+  for (const event of batch) {
+    const eventObj =
+      typeof event === "object" && event !== null
+        ? (event as { id?: unknown; type?: unknown })
+        : null;
+    const type =
+      eventObj && typeof eventObj.type === "string" ? eventObj.type : null;
+    const id =
+      eventObj && typeof eventObj.id === "string" ? eventObj.id : "unknown";
 
-export const handleBatchResult = (
-  errors: Array<{ id: string; error: unknown }>,
-  results: Array<{ id: string; result: unknown }>,
-  res: NextApiResponse,
-) => {
-  const returnedErrors: {
-    id: string;
-    status: number;
-    message?: string;
-    error?: string;
-  }[] = [];
-
-  const successes: {
-    id: string;
-    status: number;
-  }[] = [];
-
-  errors.forEach((error) => {
-    if (error.error instanceof ValidationError) {
-      returnedErrors.push({
-        id: error.id,
+    if (type && EVENTS_ONLY_ALLOWED_TYPES.has(type)) {
+      batchForProcessing.push(event);
+    } else {
+      rejectedErrors.push({
+        id,
         status: 400,
-        message: "Invalid request data",
-        error: error.error.message,
+        message: "Event type not accepted",
+        error: `Event type "${type ?? "unknown"}" ${SCORE_ONLY_REJECTION[scoreOnlyReason]}`,
       });
-    } else if (error.error instanceof UnauthorizedError) {
-      returnedErrors.push({
-        id: error.id,
+    }
+  }
+
+  return { batchForProcessing, rejectedErrors };
+}
+
+/** authorizeIngestionBatch filters out unauthorized events from the batch */
+function authorizeIngestionBatch(
+  batch: unknown[],
+  ctx: AuthorizationContext | undefined,
+  accessLevel: ApiAccessLevel,
+  projectId: string,
+): IngestionBatchFilter {
+  const batchForProcessing: unknown[] = [];
+  const rejectedErrors: IngestionEventRejection[] = [];
+  for (const event of batch) {
+    const decision = shadowAuthorize({
+      ctx,
+      action: ingestionActionForEventType(eventTypeOf(event)),
+      resource: { projectId },
+      legacyDecision: ingestionLegacyDecision(eventTypeOf(event), accessLevel),
+    });
+    if (!decision.success) {
+      rejectedErrors.push({
+        id: idOf(event),
         status: 401,
         message: "Authentication error",
-        error: error.error.message,
+        error: "Access Scope Denied",
       });
-    } else if (error.error instanceof ResourceNotFoundError) {
-      returnedErrors.push({
-        id: error.id,
-        status: 404,
-        message: "Resource not found",
-        error: error.error.message,
-      });
-    } else {
-      if (process.env.NEXT_PUBLIC_SENTRY_DSN) {
-        Sentry.captureException(error.error);
-      }
-      returnedErrors.push({
-        id: error.id,
-        status: 500,
-        error: "Internal Server Error",
-      });
+      continue;
     }
-  });
-
-  if (returnedErrors.length > 0) {
-    console.log("Error processing events", returnedErrors);
+    batchForProcessing.push(event);
   }
-
-  results.forEach((result) => {
-    successes.push({
-      id: result.id,
-      status: 201,
-    });
-  });
-
-  return res.status(207).send({ errors: returnedErrors, successes });
-};
-
-export const handleBatchResultLegacy = (
-  errors: Array<{ id: string; error: unknown }>,
-  results: Array<{ id: string; result: unknown }>,
-  res: NextApiResponse,
-) => {
-  const unknownErrors = errors.map((error) => error.error);
-
-  const badRequestErrors = getBadRequestError(unknownErrors);
-  if (badRequestErrors.length > 0) {
-    console.log("Bad request errors", badRequestErrors);
-    return res.status(400).json({
-      message: "Invalid request data",
-      errors: badRequestErrors.map((error) => error.message),
-    });
-  }
-
-  const ResourceNotFoundError = getResourceNotFoundError(unknownErrors);
-  if (ResourceNotFoundError.length > 0) {
-    return res.status(404).json({
-      message: "Resource not found",
-      errors: ResourceNotFoundError.map((error) => error.message),
-    });
-  }
-
-  if (errors.length > 0) {
-    console.log("Error processing events", unknownErrors);
-    return res.status(500).json({
-      errors: ["Internal Server Error"],
-    });
-  }
-  return res.status(200).send(results.length > 0 ? results[0]?.result : {});
-};
-
-// cleans NULL characters from the event
-export function cleanEvent(obj: unknown): unknown {
-  if (typeof obj === "string") {
-    return obj.replace(/\u0000/g, "");
-  } else if (typeof obj === "object" && obj !== null) {
-    if (Array.isArray(obj)) {
-      return obj.map(cleanEvent);
-    } else {
-      // Here we assert that obj is a Record<string, unknown>
-      const objAsRecord = obj as Record<string, unknown>;
-      const newObj: Record<string, unknown> = {};
-      for (const key in objAsRecord) {
-        newObj[key] = cleanEvent(objAsRecord[key]);
-      }
-      return newObj;
-    }
-  } else {
-    return obj;
-  }
+  return { batchForProcessing, rejectedErrors };
 }
 
-export const sendToWorkerIfEnvironmentConfigured = async (
-  batchResults: BatchResult[],
-  projectId: string,
-): Promise<void> => {
-  try {
-    if (env.LANGFUSE_WORKER_HOST && env.LANGFUSE_WORKER_PASSWORD) {
-      const traceEvents = batchResults
-        .filter((result) => result.type === eventTypes.TRACE_CREATE) // we only have create, no update.
-        .map((result) =>
-          result.result &&
-          typeof result.result === "object" &&
-          "id" in result.result
-            ? // ingestion API only gets traces for one projectId
-              { traceId: result.result.id, projectId: projectId }
-            : null,
-        )
-        .filter(isNotNullOrUndefined);
-
-      await fetch(`${env.LANGFUSE_WORKER_HOST}/api/events`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization:
-            "Basic " +
-            Buffer.from("admin" + ":" + env.LANGFUSE_WORKER_PASSWORD).toString(
-              "base64",
-            ),
-        },
-        body: JSON.stringify(traceEvents),
-      });
-    }
-  } catch (error) {
-    console.error("Error sending events to worker", error);
+function ingestionLegacyDecision(
+  eventType: string | null,
+  accessLevel: ApiAccessLevel,
+) {
+  if (
+    eventType === eventTypes.SDK_LOG ||
+    accessLevel === "project" ||
+    (eventType === eventTypes.SCORE_CREATE && accessLevel === "scores")
+  ) {
+    return { success: true as const, scope: { accessLevel } };
   }
+  return unauthorizedError("Access Scope Denied");
+}
+
+/** ingestionActionForEventType maps an event type to the project action its write asserts; SDK logs skip authz. */
+function ingestionActionForEventType(
+  type: string | null,
+): ProjectAction | typeof __dangerouslySkipAuthz {
+  if (type === eventTypes.SDK_LOG) return __dangerouslySkipAuthz;
+  if (type === eventTypes.SCORE_CREATE) return "scores:save";
+  return "traces:create";
+}
+
+/** idOf reads an event's `id`, defaulting to `unknown` for a malformed event. */
+function idOf(event: unknown): string {
+  return typeof event === "object" &&
+    event !== null &&
+    "id" in event &&
+    typeof (event as { id: unknown }).id === "string"
+    ? (event as { id: string }).id
+    : "unknown";
+}
+
+function eventTypeOf(event: unknown): string | null {
+  if (typeof event !== "object" || event === null) {
+    return null;
+  }
+  const type = (event as { type?: unknown }).type;
+  return typeof type === "string" ? type : null;
+}
+
+function batchContainsTraceOrObservationEvent(batch: unknown[]): boolean {
+  return batch.some((event) => {
+    const type = eventTypeOf(event);
+    return type !== null && TRACE_OR_OBSERVATION_EVENT_TYPES.has(type);
+  });
+}
+
+/** IngestionEventRejection is one event dropped from a batch, rendered in the 207 result's errors. */
+type IngestionEventRejection = {
+  id: string;
+  status: number;
+  message: string;
+  error: string;
+};
+
+/** IngestionBatchFilter is a batch split into the events to process and the events rejected. */
+type IngestionBatchFilter = {
+  batchForProcessing: unknown[];
+  rejectedErrors: IngestionEventRejection[];
 };

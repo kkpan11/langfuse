@@ -1,0 +1,8 @@
+import { type Route } from "../routes";
+
+export type NavigationItem = Omit<Route, "children" | "items" | "isActive"> & {
+  url: string;
+  isActive: boolean;
+  disabledReason?: string;
+  items?: NavigationItem[];
+};

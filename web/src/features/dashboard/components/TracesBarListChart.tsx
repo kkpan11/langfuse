@@ -1,34 +1,58 @@
-import { api } from "@/src/utils/api";
+/* eslint-disable @repo/no-style-props */
 import { type FilterState } from "@langfuse/shared";
-import { ExpandListButton } from "@/src/features/dashboard/components/cards/ChevronButton";
-import { useState } from "react";
-import DocPopup from "@/src/components/layouts/doc-popup";
 import { DashboardCard } from "@/src/features/dashboard/components/cards/DashboardCard";
 import { TotalMetric } from "@/src/features/dashboard/components/TotalMetric";
-import { BarList } from "@tremor/react";
-import { NoData } from "@/src/features/dashboard/components/NoData";
 import { compactNumberFormatter } from "@/src/utils/numbers";
+import { NoDataOrLoading } from "@/src/components/NoDataOrLoading";
+import { type QueryType, type ViewVersion } from "@langfuse/shared/query";
+import { formatMetric } from "@/src/features/widgets/chart-library/utils";
+import { BarListChartArea } from "@/src/features/dashboard/components/cards/BarListChartArea";
+import { traceViewQuery } from "@/src/features/dashboard/lib/dashboard-utils";
+import { useScheduledDashboardExecuteQuery } from "@/src/features/dashboard/hooks/DashboardQuerySchedulerProvider";
+import { cn } from "@/src/utils/tailwind";
+
+// Cap on bars fetched and rendered; the top list scrolls within the tile when
+// they don't all fit.
+const MAX_BARS = 20;
 
 export const TracesBarListChart = ({
   className,
   projectId,
   globalFilterState,
+  fromTimestamp,
+  toTimestamp,
+  isLoading = false,
+  metricsVersion,
+  schedulerId,
 }: {
   className?: string;
   projectId: string;
   globalFilterState: FilterState;
+  fromTimestamp: Date;
+  toTimestamp: Date;
+  isLoading?: boolean;
+  metricsVersion: ViewVersion;
+  schedulerId?: string;
 }) => {
-  const [isExpanded, setIsExpanded] = useState(false);
-  const timeFilter = globalFilterState.map((f) =>
-    f.type === "datetime" ? { ...f, column: "timestamp" } : f,
-  );
+  const isV2 = metricsVersion === "v2";
+  const traceNameField = isV2 ? "traceName" : "name";
+  const countField = isV2 ? "uniq_traceId" : "count_count";
 
-  const totalTraces = api.dashboard.chart.useQuery(
+  // Total traces query using executeQuery
+  const totalTracesQuery: QueryType = {
+    ...traceViewQuery({ metricsVersion, globalFilterState }),
+    dimensions: [],
+    timeDimension: null,
+    fromTimestamp: fromTimestamp.toISOString(),
+    toTimestamp: toTimestamp.toISOString(),
+    orderBy: null,
+  };
+
+  const totalTraces = useScheduledDashboardExecuteQuery(
     {
       projectId,
-      from: "traces",
-      select: [{ column: "traceId", agg: "COUNT" }],
-      filter: timeFilter,
+      query: totalTracesQuery,
+      version: metricsVersion,
     },
     {
       trpc: {
@@ -36,17 +60,31 @@ export const TracesBarListChart = ({
           skipBatch: true,
         },
       },
+      queryId: `${schedulerId ?? "home:traces"}:total`,
+      enabled: !isLoading,
     },
   );
 
-  const traces = api.dashboard.chart.useQuery(
+  // Traces grouped by name query using executeQuery
+  const tracesQuery: QueryType = {
+    ...traceViewQuery({
+      metricsVersion,
+      globalFilterState,
+      groupedByName: true,
+    }),
+    dimensions: [{ field: traceNameField }],
+    timeDimension: null,
+    fromTimestamp: fromTimestamp.toISOString(),
+    toTimestamp: toTimestamp.toISOString(),
+    orderBy: [{ field: countField, direction: "desc" }],
+    chartConfig: { type: "table", row_limit: MAX_BARS },
+  };
+
+  const traces = useScheduledDashboardExecuteQuery(
     {
       projectId,
-      from: "traces",
-      select: [{ column: "traceId", agg: "COUNT" }, { column: "traceName" }],
-      filter: timeFilter,
-      groupBy: [{ column: "traceName", type: "string" }],
-      orderBy: [{ column: "traceId", direction: "DESC", agg: "COUNT" }],
+      query: tracesQuery,
+      version: metricsVersion,
     },
     {
       trpc: {
@@ -54,69 +92,59 @@ export const TracesBarListChart = ({
           skipBatch: true,
         },
       },
+      queryId: `${schedulerId ?? "home:traces"}:grouped`,
+      enabled: !isLoading,
     },
   );
 
-  const transformedTraces = traces.data
-    ? traces.data.map((item) => {
-        return {
-          name: item.traceName ? (item.traceName as string) : "Unknown",
-          value: item.countTraceId as number,
-        };
-      })
-    : [];
-
-  const maxNumberOfEntries = { collapsed: 5, expanded: 20 };
-
-  const adjustedData = isExpanded
-    ? transformedTraces.slice(0, maxNumberOfEntries.expanded)
-    : transformedTraces.slice(0, maxNumberOfEntries.collapsed);
+  // Transform the data to match the expected format for the BarList
+  const transformedTraces =
+    traces.data?.map((item: any) => {
+      return {
+        name: item[traceNameField]
+          ? (item[traceNameField] as string)
+          : "Unknown",
+        value: Number(item[countField]),
+      };
+    }) ?? [];
 
   return (
     <DashboardCard
-      className={className}
-      title={"Traces"}
+      // h-full pins the card to the tile so the chart area gets the AVAILABLE
+      // height, not its own content; min-h-0 on the content lets the flex
+      // column shrink so the top list scrolls internally instead of
+      // overflowing the tile.
+      className={cn(className, "h-full")}
+      cardContentClassName="min-h-0"
+      title="Traces"
       description={null}
-      isLoading={traces.isLoading || totalTraces.isLoading}
+      isLoading={isLoading || traces.isPending || totalTraces.isPending}
     >
       <>
         <TotalMetric
           metric={compactNumberFormatter(
-            totalTraces.data?.[0]?.countTraceId as number,
+            totalTraces.data?.[0]?.[countField]
+              ? Number(totalTraces.data[0][countField])
+              : 0,
           )}
-          description={"Total traces tracked"}
+          description="Total traces tracked"
         />
-        {adjustedData.length > 0 ? (
-          <>
-            <BarList
-              data={adjustedData}
-              valueFormatter={(number: number) =>
-                Intl.NumberFormat("us").format(number).toString()
-              }
-              className="mt-6"
-              showAnimation={true}
-              color={"indigo"}
-            />
-          </>
+        {transformedTraces.length > 0 ? (
+          <BarListChartArea
+            data={transformedTraces}
+            maxBars={MAX_BARS}
+            metricLabel="Traces"
+            unit="traces"
+            metricFormatter={(value) => formatMetric(value, { style: "full" })}
+          />
         ) : (
-          <NoData noDataText="No data">
-            <DocPopup
-              description="Traces contain details about LLM applications and can be created using the SDK."
-              href="https://langfuse.com/docs/integrations/sdk#1-backend-tracing"
-            />
-          </NoData>
+          <NoDataOrLoading
+            isLoading={isLoading || traces.isPending || totalTraces.isPending}
+            description="Traces contain details about LLM applications and can be created using the SDK."
+            href="https://langfuse.com/docs/get-started"
+            className="h-auto grow"
+          />
         )}
-        <ExpandListButton
-          isExpanded={isExpanded}
-          setExpanded={setIsExpanded}
-          totalLength={transformedTraces.length}
-          maxLength={maxNumberOfEntries.collapsed}
-          expandText={
-            transformedTraces.length > maxNumberOfEntries.expanded
-              ? `Show top ${maxNumberOfEntries.expanded}`
-              : "Show all"
-          }
-        />
       </>
     </DashboardCard>
   );

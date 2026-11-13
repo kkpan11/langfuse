@@ -1,117 +1,107 @@
-import { ChevronLeftIcon, ChevronRightIcon } from "@heroicons/react/20/solid";
+/* eslint-disable @repo/no-style-props, @repo/no-margin-on-root-elements, @repo/component-file-structure */
 import Link from "next/link";
-import { useRouter } from "next/router";
-import { useSession } from "next-auth/react";
 import DocPopup from "@/src/components/layouts/doc-popup";
-import { type Status, StatusBadge } from "./status-badge";
+import { Badge } from "@/src/components/design-system/Badge/Badge";
+import {
+  type Status,
+  StatusBadge,
+} from "@/src/components/ui/StatusBadge/StatusBadge";
 import { cn } from "@/src/utils/tailwind";
+import { FeatureReleaseStatus } from "@/src/components/design-system/FeatureReleaseStatus/FeatureReleaseStatus";
 
-export default function Header({
-  level = "h2",
-  ...props
-}: {
+type HeaderProps = {
   title: string;
-  breadcrumb?: { name: string; href?: string }[];
+  titleClassName?: string;
   status?: Status;
-  help?: { description: string; href?: string };
+  /** Plain informational badge next to the title, e.g. "Demo Org". Not a status. */
+  labelBadge?: string;
+  /** Marks a surface only internal users can see with the shared internal-feature badge. */
+  internal?: boolean;
+  label?: {
+    text: string;
+    href: string;
+  };
+  help?: { description: string; href?: string; className?: string };
   actionButtons?: React.ReactNode;
-  level?: "h2" | "h3";
+  className?: string;
+};
+
+export default function Header({ ...props }: HeaderProps) {
+  return <BaseHeader {...props} level="h3" />;
+}
+
+export function SubHeader({ ...props }: HeaderProps) {
+  return <BaseHeader {...props} level="h4" />;
+}
+
+export function SubHeaderLabel({ ...props }: HeaderProps) {
+  return <BaseHeader {...props} level="h5" />;
+}
+
+function HeaderTitle({
+  level,
+  title,
+  className,
+}: {
+  level: "h3" | "h4" | "h5";
+  title: string;
+  className?: string;
 }) {
-  const router = useRouter();
-  const session = useSession();
+  // Top-level titles are bold (the font-relative role) and sit on the
+  // primary emphasis tier (the shell's sidebar tint would dim them);
+  // sub-levels follow the text-* token weight — hierarchy below h3 is
+  // carried by size.
+  switch (level) {
+    case "h3":
+      return (
+        <h3
+          className={cn("text-primary text-lg leading-7 font-bold", className)}
+        >
+          {title}
+        </h3>
+      );
+    case "h4":
+      return <h4 className={cn("text-lg", className)}>{title}</h4>;
+    case "h5":
+      return <h5 className={cn("text-base", className)}>{title}</h5>;
+  }
+}
 
-  const currentPath = router.pathname;
-  const projectId = router.query.projectId;
-
-  const project = session.data?.user?.projects.find((p) => p.id === projectId);
-  const breadcrumb = [
-    ...(project && projectId && currentPath !== "/project/[projectId]"
-      ? [
-          {
-            name: project.name,
-            href: `/project/${projectId as string}`,
-          },
-        ]
-      : []),
-    ...(props.breadcrumb ?? []),
-  ];
-  const backHref =
-    props.breadcrumb &&
-    [...props.breadcrumb.map((i) => i.href).filter(Boolean)].pop();
-
+function BaseHeader({ ...props }: HeaderProps & { level: "h3" | "h4" | "h5" }) {
   return (
-    <div className={cn(level === "h2" ? "mb-4" : "mb-1")}>
-      <div>
-        {backHref ? (
-          <nav className="sm:hidden" aria-label="Back">
-            <Link
-              href={backHref}
-              className="flex items-center text-sm font-medium text-gray-500 hover:text-gray-700"
-            >
-              <ChevronLeftIcon
-                className="-ml-1 mr-1 h-5 w-5 flex-shrink-0 text-gray-400"
-                aria-hidden="true"
-              />
-              Back
-            </Link>
-          </nav>
-        ) : null}
-        {(level === "h2" || props.breadcrumb) && breadcrumb.length ? (
-          <nav className="hidden sm:flex" aria-label="Breadcrumb">
-            <ol role="list" className="flex items-center space-x-4">
-              {breadcrumb.map(({ name, href }, index) => (
-                <li key={index}>
-                  <div className="flex items-center">
-                    {index !== 0 && (
-                      <ChevronRightIcon
-                        className="mr-4 h-5 w-5 flex-shrink-0 text-gray-400"
-                        aria-hidden="true"
-                      />
-                    )}
-                    {href ? (
-                      <Link
-                        href={href}
-                        className="text-sm font-medium text-gray-500 hover:text-gray-700"
-                      >
-                        {name}
-                      </Link>
-                    ) : (
-                      <div className="text-sm font-medium text-gray-500">
-                        {name}
-                      </div>
-                    )}
-                  </div>
-                </li>
-              ))}
-            </ol>
-          </nav>
-        ) : null}
-      </div>
-      <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
+    <div className={cn(props.className, props.level === "h3" && "mb-2")}>
+      <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex items-center gap-3 md:gap-5">
-          <div className="flex min-w-0 flex-row">
-            {level === "h2" ? (
-              <h2 className="text-2xl font-bold leading-7 text-gray-900 sm:truncate sm:text-3xl sm:tracking-tight">
-                {props.title}
-              </h2>
-            ) : (
-              <h3 className="text-lg font-bold leading-7 text-gray-900 sm:truncate sm:text-xl sm:tracking-tight">
-                {props.title}
-              </h3>
-            )}
+          <div className="flex min-w-0 flex-row items-center">
+            <HeaderTitle
+              title={props.title}
+              level={props.level}
+              className={props.titleClassName}
+            />
             {props.help ? (
               <DocPopup
                 description={props.help.description}
                 href={props.help.href}
-                size="sm"
+                className={props.help.className}
               />
             ) : null}
           </div>
           {props.status && <StatusBadge type={props.status} />}
+          {props.internal && <FeatureReleaseStatus status="internal" />}
+          {props.labelBadge && (
+            <Badge color="filled" size="sm" text={props.labelBadge} />
+          )}
+          {props.label && (
+            <Link href={props.label.href} className="flex">
+              <Badge color="filled" size="sm" text={props.label.text} />
+            </Link>
+          )}
         </div>
-        <div className="flex items-center gap-3">
-          {props.actionButtons ?? null}
-        </div>
+        {props.actionButtons ? (
+          <div className="flex flex-wrap items-center gap-3">
+            {props.actionButtons}
+          </div>
+        ) : null}
       </div>
     </div>
   );

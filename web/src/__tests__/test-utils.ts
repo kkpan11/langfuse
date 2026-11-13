@@ -1,40 +1,140 @@
-import { getDisplaySecretKey, hashSecretKey } from "@langfuse/shared";
-import { prisma } from "@langfuse/shared/src/db";
-import { hash } from "bcryptjs";
+import {
+  CodeEvalExecutionQueue,
+  EvalExecutionQueue,
+  LLMAsJudgeExecutionQueue,
+  TopicsTraceQueue,
+  SecondaryEvalExecutionQueue,
+  SecondaryIngestionQueue,
+  SecondaryOtelIngestionQueue,
+  createBasicAuthHeader,
+  getQueue,
+  IngestionQueue,
+  logger,
+  OtelIngestionQueue,
+  QueueName,
+  TraceUpsertQueue,
+} from "@langfuse/shared/src/server";
+import { type z } from "zod";
 
-export const pruneDatabase = async () => {
-  await prisma.score.deleteMany();
-  await prisma.observation.deleteMany();
-  await prisma.trace.deleteMany();
-  await prisma.datasetItem.deleteMany();
-  await prisma.dataset.deleteMany();
-  await prisma.datasetRuns.deleteMany();
-  await prisma.prompt.deleteMany();
-  await prisma.events.deleteMany();
-  await prisma.model.deleteMany();
+const getQueues = () => {
+  const queues: string[] = Object.values(QueueName);
+  queues.push(
+    ...IngestionQueue.getShardNames(),
+    ...SecondaryIngestionQueue.getShardNames(),
+    ...EvalExecutionQueue.getShardNames(),
+    ...SecondaryEvalExecutionQueue.getShardNames(),
+    ...LLMAsJudgeExecutionQueue.getShardNames(),
+    ...TopicsTraceQueue.getShardNames(),
+    ...CodeEvalExecutionQueue.getShardNames(),
+    ...OtelIngestionQueue.getShardNames(),
+    ...SecondaryOtelIngestionQueue.getShardNames(),
+    ...TraceUpsertQueue.getShardNames(),
+  );
+
+  const listOfQueuesToIgnore = [
+    QueueName.DataRetentionQueue,
+    QueueName.BlobStorageIntegrationQueue,
+    QueueName.DeadLetterRetryQueue,
+    QueueName.PostHogIntegrationQueue,
+    QueueName.CloudFreeTierUsageThresholdQueue,
+  ];
+
+  return queues
+    .filter(
+      (queueName) => !listOfQueuesToIgnore.includes(queueName as QueueName),
+    )
+    .map((queueName) => {
+      if (queueName.startsWith(QueueName.IngestionQueue)) {
+        return IngestionQueue.getInstance({ shardName: queueName });
+      }
+      if (queueName.startsWith(QueueName.IngestionSecondaryQueue)) {
+        return SecondaryIngestionQueue.getInstance({ shardName: queueName });
+      }
+      if (queueName.startsWith(QueueName.EvaluationExecution)) {
+        return EvalExecutionQueue.getInstance({ shardName: queueName });
+      }
+      if (queueName.startsWith(QueueName.EvaluationExecutionSecondaryQueue)) {
+        return SecondaryEvalExecutionQueue.getInstance({
+          shardName: queueName,
+        });
+      }
+      if (queueName.startsWith(QueueName.TopicsTrace)) {
+        return TopicsTraceQueue.getInstance({ shardName: queueName });
+      }
+      if (queueName.startsWith(QueueName.LLMAsJudgeExecution)) {
+        return LLMAsJudgeExecutionQueue.getInstance({
+          shardName: queueName,
+        });
+      }
+      if (queueName.startsWith(QueueName.CodeEvalExecution)) {
+        return CodeEvalExecutionQueue.getInstance({
+          shardName: queueName,
+        });
+      }
+      if (queueName.startsWith(QueueName.TraceUpsert)) {
+        return TraceUpsertQueue.getInstance({ shardName: queueName });
+      }
+      if (queueName.startsWith(QueueName.OtelIngestionSecondaryQueue)) {
+        return SecondaryOtelIngestionQueue.getInstance({
+          shardName: queueName,
+        });
+      }
+      if (queueName.startsWith(QueueName.OtelIngestionQueue)) {
+        return OtelIngestionQueue.getInstance({
+          shardName: queueName,
+        });
+      }
+      return getQueue(
+        queueName as Exclude<
+          QueueName,
+          | QueueName.IngestionQueue
+          | QueueName.IngestionSecondaryQueue
+          | QueueName.EvaluationExecution
+          | QueueName.EvaluationExecutionSecondaryQueue
+          | QueueName.LLMAsJudgeExecution
+          | QueueName.TopicsTrace
+          | QueueName.CodeEvalExecution
+          | QueueName.TraceUpsert
+          | QueueName.OtelIngestionQueue
+          | QueueName.OtelIngestionSecondaryQueue
+        >,
+      );
+    });
 };
 
-export function createBasicAuthHeader(
-  username: string,
-  password: string,
-): string {
-  const base64Credentials = Buffer.from(`${username}:${password}`).toString(
-    "base64",
+export const disconnectQueues = async (disconnectTimeoutMs = 2_000) => {
+  await Promise.all(
+    getQueues().map(async (queue) => {
+      if (queue) {
+        let timeoutId: NodeJS.Timeout | undefined;
+        try {
+          await Promise.race([
+            queue.disconnect(),
+            new Promise<void>((resolve) => {
+              timeoutId = setTimeout(resolve, disconnectTimeoutMs);
+            }),
+          ]);
+        } catch (error) {
+          logger.error(`Error disconnecting queue ${queue.name}: ${error}`);
+        } finally {
+          if (timeoutId) clearTimeout(timeoutId);
+        }
+      }
+    }),
   );
-  return `Basic ${base64Credentials}`;
-}
+};
 
 export type IngestionAPIResponse = {
   errors: ErrorIngestion[];
   successes: SuccessfulIngestion[];
 };
 
-export type SuccessfulIngestion = {
+type SuccessfulIngestion = {
   id: string;
   status: number;
 };
 
-export type ErrorIngestion = {
+type ErrorIngestion = {
   id: string;
   status: number;
   message: string;
@@ -46,8 +146,10 @@ export async function makeAPICall<T = IngestionAPIResponse>(
   url: string,
   body?: unknown,
   auth?: string,
+  customHeaders?: Record<string, string>,
 ): Promise<{ body: T; status: number }> {
-  const finalUrl = `http://localhost:3000/${url}`;
+  const baseUrl = process.env.TEST_BASE_URL ?? "http://localhost:3000";
+  const finalUrl = `${baseUrl}${url.startsWith("/") ? url : `/${url}`}`;
   const authorization =
     auth || createBasicAuthHeader("pk-lf-1234567890", "sk-lf-1234567890");
   const options = {
@@ -56,46 +158,85 @@ export async function makeAPICall<T = IngestionAPIResponse>(
       Accept: "application/json",
       "Content-Type": "application/json;charset=UTF-8",
       Authorization: authorization,
+      ...customHeaders,
     },
     ...(method !== "GET" &&
       body !== undefined && { body: JSON.stringify(body) }),
   };
   const response = await fetch(finalUrl, options);
-  const responseBody = (await response.json()) as T;
-  return { body: responseBody, status: response.status };
+
+  // Handle 204 No Content - no body to parse
+  if (response.status === 204) {
+    return { body: {} as T, status: response.status };
+  }
+
+  // Clone the response before attempting to parse JSON
+  const clonedResponse = response.clone();
+
+  try {
+    const responseBody = (await response.json()) as T;
+    return { body: responseBody, status: response.status };
+  } catch (error) {
+    // Handle JSON parsing errors using the cloned response
+    const responseText = await clonedResponse.text();
+    throw new Error(
+      `Failed to parse JSON response: ${error instanceof Error ? error.message : String(error)}. Response status: ${response.status}. Response headers: ${JSON.stringify(Object.fromEntries(response.headers.entries()))}. Response text: ${responseText}. Method: ${method}, URL: ${finalUrl}, Request body: ${body ? JSON.stringify(body) : "none"}`,
+    );
+  }
 }
 
-export const setupUserAndProject = async () => {
-  const user = await prisma.user.create({
-    data: {
-      id: "user-1",
-      name: "Demo User",
-      email: "demo@langfuse.com",
-      password: await hash("password", 12),
-    },
-  });
+export async function makeZodVerifiedAPICall<T extends z.ZodType>(
+  responseZodSchema: T,
+  method: "POST" | "GET" | "PUT" | "DELETE" | "PATCH",
+  url: string,
+  body?: unknown,
+  auth?: string,
+  statusCode = 200,
+): Promise<{ body: z.infer<T>; status: number }> {
+  const { body: resBody, status } = await makeAPICall<z.infer<T>>(
+    method,
+    url,
+    body,
+    auth,
+  );
+  if (status !== statusCode) {
+    throw new Error(
+      `API call did not return ${statusCode}, returned status ${status}, body ${JSON.stringify(resBody)}`,
+    );
+  }
+  const typeCheckResult = responseZodSchema.safeParse(resBody);
+  if (!typeCheckResult.success) {
+    console.error(typeCheckResult.error);
+    throw new Error(
+      `API call (${method} ${url}) did not return valid response, returned status ${status}, body ${JSON.stringify(resBody)}, error ${typeCheckResult.error}`,
+    );
+  }
+  return { body: resBody, status };
+}
 
-  const project = await prisma.project.create({
-    data: {
-      id: "7a88fb47-b4e2-43b8-a06c-a5ce950dc53a",
-      name: "llm-app",
-      apiKeys: {
-        create: [
-          {
-            note: "seeded key",
-            hashedSecretKey: await hashSecretKey("sk-lf-1234567890"),
-            displaySecretKey: getDisplaySecretKey("sk-lf-1234567890"),
-            publicKey: "pk-lf-1234567890",
-          },
-        ],
-      },
-      members: {
-        create: {
-          role: "OWNER",
-          userId: user.id,
-        },
-      },
-    },
-  });
-  return { user, project };
-};
+export async function makeZodVerifiedAPICallSilent<T extends z.ZodType>(
+  responseZodSchema: T,
+  method: "POST" | "GET" | "PUT" | "DELETE" | "PATCH",
+  url: string,
+  body?: unknown,
+  auth?: string,
+): Promise<{ body: z.infer<T>; status: number }> {
+  const { body: resBody, status } = await makeAPICall<z.infer<T>>(
+    method,
+    url,
+    body,
+    auth,
+  );
+
+  if (status === 200) {
+    const typeCheckResult = responseZodSchema.safeParse(resBody);
+    if (!typeCheckResult.success) {
+      console.error(typeCheckResult.error);
+      throw new Error(
+        `API call (${method} ${url}) did not return valid response, returned status ${status}, body ${JSON.stringify(resBody)}, error ${typeCheckResult.error}`,
+      );
+    }
+  }
+
+  return { body: resBody, status };
+}

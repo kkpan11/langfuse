@@ -1,78 +1,93 @@
-import {
-  HoverCard,
-  HoverCardContent,
-  HoverCardTrigger,
-} from "@/src/components/ui/hover-card";
-import { HelpCircle, Info } from "lucide-react";
-import Link from "next/link";
-import { usePostHog } from "posthog-js/react";
+/* eslint-disable @repo/no-style-props, @repo/component-file-structure */
+import { useState } from "react";
+import { HoverCard } from "@/src/components/design-system/HoverCard/HoverCard";
+import { ControlledHoverCard } from "@/src/components/design-system/ControlledHoverCard/ControlledHoverCard";
+import { usePostHogClientCapture } from "@/src/features/posthog-analytics/usePostHogClientCapture";
+import { cn } from "@/src/utils/tailwind";
+import { ExternalLink, Info } from "@langfuse/icons";
 
 export type DocPopupProps = {
   description: React.ReactNode;
   href?: string;
-  style?: "question" | "info";
-  size?: "xs" | "sm" | "md" | "lg";
+  className?: string;
 };
 
 export default function DocPopup({
   description,
   href,
-  style = "info",
-  size = "sm",
+  className,
 }: DocPopupProps) {
-  const sizes = {
-    xs: "w-3 h-3",
-    sm: "w-4 h-4",
-    md: "w-6 h-6",
-    lg: "w-8 h-8",
+  const capture = usePostHogClientCapture();
+  // Controlled so a CLICK/TAP on the icon also opens the card: HoverCard
+  // never opens on touch by itself, and the old click-to-navigate behavior
+  // is gone — docs open only via the explicit link inside the card.
+  const [open, setOpen] = useState(false);
+  // Single open-change path: Floating UI only calls onOpenChange from its own
+  // hover/focus handling, so the click handler must route through here too
+  // or tap-opens (the only way in on touch) would never be captured.
+  const handleOpenChange = (nextOpen: boolean) => {
+    setOpen(nextOpen);
+    if (nextOpen) {
+      capture("help_popup:opened", {
+        hfref: href,
+        description: description,
+      });
+    }
   };
-  const posthog = usePostHog();
 
   return (
-    <HoverCard
+    <ControlledHoverCard
       openDelay={200}
-      onOpenChange={(open) => {
-        if (open) {
-          posthog.capture("help-popup:opened", { href, description });
-        }
-      }}
-    >
-      <HoverCardTrigger className="mx-1 cursor-pointer" asChild>
-        {href ? (
-          <Link
-            href={href}
-            rel="noopener"
-            target="_blank"
-            className="inline-block whitespace-nowrap text-gray-500 sm:pl-0"
+      open={open}
+      onOpenChange={handleOpenChange}
+      content={
+        <div className="w-64 p-3">
+          <div
+            className={cn(
+              "text-primary text-xs font-normal whitespace-break-spaces sm:pl-0",
+              className,
+            )}
           >
-            {
-              {
-                question: <HelpCircle className={sizes[size]} />,
-                info: <Info className={sizes[size]} />,
-              }[style]
-            }
-          </Link>
-        ) : (
-          <div className="inline-block whitespace-nowrap text-gray-500 sm:pl-0">
-            {
-              {
-                question: <HelpCircle className={sizes[size]} />,
-                info: <Info className={sizes[size]} />,
-              }[style]
-            }
-          </div>
-        )}
-      </HoverCardTrigger>
-      <HoverCardContent>
-        {typeof description === "string" ? (
-          <div className="whitespace-break-spaces text-xs font-normal text-gray-800 sm:pl-0">
             {description}
           </div>
-        ) : (
-          description
-        )}
-      </HoverCardContent>
-    </HoverCard>
+          {href && (
+            <a
+              href={href}
+              target="_blank"
+              rel="noopener noreferrer"
+              onClick={(e) => {
+                e.stopPropagation();
+                capture("help_popup:href_clicked", {
+                  href: href,
+                  description: description,
+                });
+              }}
+              className="text-muted-foreground hover:text-primary mt-2 inline-flex items-center gap-1 text-xs underline underline-offset-2"
+            >
+              Read docs
+              <ExternalLink size="sm" />
+            </a>
+          )}
+        </div>
+      }
+    >
+      {({ getTriggerProps }) => (
+        <button
+          type="button"
+          aria-label="More information"
+          className="text-muted-foreground mx-1 inline-block cursor-help whitespace-nowrap sm:pl-0"
+          {...getTriggerProps({
+            onClick: (e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              handleOpenChange(!open);
+            },
+          })}
+        >
+          <Info size="sm" />
+        </button>
+      )}
+    </ControlledHoverCard>
   );
 }
 
@@ -83,19 +98,25 @@ export type PopupProps = {
 
 export function Popup({ triggerContent, description }: PopupProps) {
   return (
-    <HoverCard openDelay={200}>
-      <HoverCardTrigger className="mx-1 cursor-pointer" asChild>
-        <div>{triggerContent}</div>
-      </HoverCardTrigger>
-      <HoverCardContent>
-        {typeof description === "string" ? (
-          <div className="whitespace-break-spaces text-xs font-normal text-gray-800 sm:pl-0">
+    <HoverCard
+      openDelay={200}
+      content={
+        <div className="w-64 p-3">
+          <div className="text-primary text-xs font-normal whitespace-break-spaces sm:pl-0">
             {description}
           </div>
-        ) : (
-          description
-        )}
-      </HoverCardContent>
+        </div>
+      }
+    >
+      {({ getTriggerProps }) => (
+        <div
+          className="mx-1 cursor-pointer"
+          tabIndex={0}
+          {...getTriggerProps()}
+        >
+          {triggerContent}
+        </div>
+      )}
     </HoverCard>
   );
 }

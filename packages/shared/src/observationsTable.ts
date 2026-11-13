@@ -1,16 +1,21 @@
-import { ObservationLevel } from "@prisma/client";
+import { ObservationLevelType } from "./domain/observations";
 import {
-  type OptionsDefinition,
+  type SingleValueOption,
   type ColumnDefinition,
-} from "./interfaces/tableDefinition";
+  MultiValueOption,
+} from "./tableDefinitions/types";
+
+import { formatColumnOptions } from "./tableDefinitions/typeHelpers";
 
 // to be used server side
 export const observationsTableCols: ColumnDefinition[] = [
   {
     name: "ID",
     id: "id",
-    type: "string",
+    // stringOptions type needed for comment filtering to inject "any of" filter with matching object IDs
+    type: "stringOptions",
     internal: 'o."id"',
+    options: [], // to be added at runtime
   },
   {
     name: "Name",
@@ -18,16 +23,46 @@ export const observationsTableCols: ColumnDefinition[] = [
     type: "stringOptions",
     internal: 'o."name"',
     options: [], // to be added at runtime
+    nullable: true,
+  },
+  {
+    name: "type",
+    id: "type",
+    type: "stringOptions",
+    options: [],
+    internal: 'o."type"',
   },
   { name: "Trace ID", id: "traceId", type: "string", internal: 't."id"' },
+  {
+    name: "Parent Observation ID",
+    id: "parentObservationId",
+    type: "string",
+    internal: 'o."parent_observation_id"',
+    nullable: true,
+  },
   {
     name: "Trace Name",
     id: "traceName",
     type: "stringOptions",
     internal: 't."name"',
     options: [], // to be added at runtime
+    nullable: true,
   },
-  { name: "User ID", id: "userId", type: "string", internal: 't."user_id"' },
+  {
+    name: "User ID",
+    id: "userId",
+    type: "string",
+    internal: 't."user_id"',
+    nullable: true,
+  },
+  {
+    name: "Environment",
+    id: "environment",
+    type: "stringOptions",
+    internal: 'o."environment"',
+    options: [], // to be added at runtime
+    nullable: true,
+  },
   {
     name: "Start Time",
     id: "startTime",
@@ -44,7 +79,9 @@ export const observationsTableCols: ColumnDefinition[] = [
     name: "Time To First Token (s)",
     id: "timeToFirstToken",
     type: "number",
-    internal: 'o."completion_start_time" - o."start_time"',
+    internal:
+      'EXTRACT(EPOCH FROM (o."completion_start_time" - o."start_time"))',
+    nullable: true,
   },
   {
     name: "Latency (s)",
@@ -53,41 +90,52 @@ export const observationsTableCols: ColumnDefinition[] = [
     internal: '"latency"',
   },
   {
-    name: "Time Per Output Token (s)",
-    id: "timePerOutputToken",
+    name: "Tokens per second",
+    id: "tokensPerSecond",
     type: "number",
-    internal: '"latency" / o."completion_tokens"',
+    internal: 'o."completion_tokens" / "latency"',
+    nullable: true,
   },
   {
     name: "Input Cost ($)",
     id: "inputCost",
     type: "number",
     internal: 'o."calculated_input_cost"',
+    nullable: true,
   },
   {
     name: "Output Cost ($)",
     id: "outputCost",
     type: "number",
     internal: 'o."calculated_output_cost"',
+    nullable: true,
   },
   {
     name: "Total Cost ($)",
     id: "totalCost",
     type: "number",
     internal: 'o."calculated_total_cost"',
+    nullable: true,
   },
   {
-    name: "Level",
+    name: "Status",
     id: "level",
     type: "stringOptions",
     internal: 'o."level"::text',
-    options: Object.values(ObservationLevel).map((value) => ({ value })),
+    options: [
+      { value: "DEBUG" },
+      { value: "DEFAULT" },
+      { value: "WARNING" },
+      { value: "ERROR" },
+    ] as { value: ObservationLevelType }[],
+    aliases: ["Level"],
   },
   {
     name: "Status Message",
     id: "statusMessage",
     type: "string",
     internal: 'o."status_message"',
+    nullable: true,
   },
   {
     name: "Model",
@@ -95,29 +143,45 @@ export const observationsTableCols: ColumnDefinition[] = [
     type: "stringOptions",
     internal: 'o."model"',
     options: [], // to be added at runtime
+    nullable: true,
+  },
+  {
+    name: "Model ID",
+    id: "modelId",
+    type: "stringOptions",
+    internal: 'o."internal_model_id"',
+    options: [], // to be added at runtime
+    nullable: true,
   },
   {
     name: "Input Tokens",
     id: "inputTokens",
     type: "number",
+    step: 1,
     internal: 'o."prompt_tokens"',
+    nullable: true,
   },
   {
     name: "Output Tokens",
     id: "outputTokens",
     type: "number",
+    step: 1,
     internal: 'o."completion_tokens"',
+    nullable: true,
   },
   {
     name: "Total Tokens",
     id: "totalTokens",
     type: "number",
+    step: 1,
     internal: 'o."total_tokens"',
+    nullable: true,
   },
   {
-    name: "Usage",
-    id: "usage",
+    name: "Tokens",
+    id: "tokens",
     type: "number",
+    step: 1,
     internal: 'o."total_tokens"',
   },
   {
@@ -127,16 +191,32 @@ export const observationsTableCols: ColumnDefinition[] = [
     internal: 'o."metadata"',
   },
   {
-    name: "Scores",
+    name: "Scores (numeric)",
     id: "scores_avg",
     type: "numberObject",
     internal: "scores_avg",
+  },
+  {
+    name: "Scores (categorical)",
+    id: "score_categories",
+    type: "categoryOptions",
+    internal: "score_categories",
+    options: [], // to be added at runtime
+    nullable: true,
+  },
+  {
+    name: "Scores (boolean)",
+    id: "score_booleans",
+    type: "booleanObject",
+    internal: "score_booleans",
+    nullable: true,
   },
   {
     name: "Version",
     id: "version",
     type: "string",
     internal: 'o."version"',
+    nullable: true,
   },
   {
     name: "Prompt Name",
@@ -144,43 +224,130 @@ export const observationsTableCols: ColumnDefinition[] = [
     type: "stringOptions",
     internal: "p.name",
     options: [], // to be added at runtime
+    nullable: true,
   },
   {
     name: "Prompt Version",
     id: "promptVersion",
     type: "number",
+    step: 1,
     internal: "p.version",
+    nullable: true,
+  },
+  {
+    name: "Trace Tags",
+    id: "tags",
+    type: "arrayOptions",
+    internal: "t.tags",
+    options: [], // to be added at runtime
+  },
+  {
+    name: "Comment Count",
+    id: "commentCount",
+    type: "number",
+    step: 1,
+    internal: "", // handled by comment filter helpers
+  },
+  {
+    name: "Comment Content",
+    id: "commentContent",
+    type: "string",
+    internal: "", // handled by comment filter helpers
+  },
+  {
+    name: "Available Tool Names",
+    id: "toolNames",
+    type: "arrayOptions",
+    internal: "", // ClickHouse only - uses mapKeys(tool_definitions)
+    options: [], // to be added at runtime
+    nullable: true,
+  },
+  {
+    name: "Called Tool Names",
+    id: "calledToolNames",
+    type: "arrayOptions",
+    internal: "", // ClickHouse only - uses tool_call_names
+    options: [], // to be added at runtime
+    nullable: true,
+  },
+  {
+    name: "Available Tools",
+    id: "toolDefinitions",
+    type: "number",
+    step: 1,
+    internal: "", // ClickHouse only
+    nullable: true,
+  },
+  {
+    name: "Tool Calls",
+    id: "toolCalls",
+    type: "number",
+    step: 1,
+    internal: "", // ClickHouse only
+    nullable: true,
   },
 ];
 
 // to be used client side, insert options for use in filter-builder
 // allows for undefined options, to offer filters while options are still loading
 export type ObservationOptions = {
-  model: Array<OptionsDefinition>;
-  name: Array<OptionsDefinition>;
-  traceName: Array<OptionsDefinition>;
+  model: Array<SingleValueOption>;
+  modelId: Array<SingleValueOption>;
+  name: Array<SingleValueOption>;
+  traceName: Array<SingleValueOption>;
+  environment: Array<SingleValueOption>;
   scores_avg: Array<string>;
-  promptName: Array<OptionsDefinition>;
+  score_categories: Array<MultiValueOption>;
+  score_booleans: Array<string>;
+  promptName: Array<SingleValueOption>;
+  tags: Array<SingleValueOption>;
+  type: Array<SingleValueOption>;
+  toolNames: Array<SingleValueOption>;
+  calledToolNames: Array<SingleValueOption>;
 };
 
 export function observationsTableColsWithOptions(
-  options?: ObservationOptions
+  options?: ObservationOptions,
 ): ColumnDefinition[] {
   return observationsTableCols.map((col) => {
     if (col.id === "model") {
-      return { ...col, options: options?.model ?? [] };
+      return formatColumnOptions(col, options?.model ?? []);
+    }
+    if (col.id === "modelId") {
+      return formatColumnOptions(col, options?.modelId ?? []);
     }
     if (col.id === "name") {
-      return { ...col, options: options?.name ?? [] };
+      return formatColumnOptions(col, options?.name ?? []);
     }
     if (col.id === "traceName") {
-      return { ...col, options: options?.traceName ?? [] };
+      return formatColumnOptions(col, options?.traceName ?? []);
+    }
+    if (col.id === "environment") {
+      return formatColumnOptions(col, options?.environment ?? []);
     }
     if (col.id === "scores_avg") {
-      return { ...col, keyOptions: options?.scores_avg ?? [] };
+      return formatColumnOptions(col, options?.scores_avg ?? []);
+    }
+    if (col.id === "score_categories") {
+      return formatColumnOptions(col, options?.score_categories ?? []);
+    }
+    if (col.id === "score_booleans") {
+      return formatColumnOptions(col, options?.score_booleans ?? []);
     }
     if (col.id === "promptName") {
-      return { ...col, options: options?.promptName ?? [] };
+      return formatColumnOptions(col, options?.promptName ?? []);
+    }
+    if (col.id === "tags") {
+      return formatColumnOptions(col, options?.tags ?? []);
+    }
+    if (col.id === "type") {
+      return formatColumnOptions(col, options?.type ?? []);
+    }
+    if (col.id === "toolNames") {
+      return formatColumnOptions(col, options?.toolNames ?? []);
+    }
+    if (col.id === "calledToolNames") {
+      return formatColumnOptions(col, options?.calledToolNames ?? []);
     }
     return col;
   });

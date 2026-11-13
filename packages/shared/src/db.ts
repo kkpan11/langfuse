@@ -1,52 +1,84 @@
+/* eslint-disable @typescript-eslint/no-use-before-define */
 // This file exports the prisma db connection, the Prisma Object, and the Typescript types.
 // This is not imported in the index.ts file of this package, as we must not import this into FE code.
 
-import { PrismaClient } from "@prisma/client";
+import { type Prisma, PrismaClient } from "@prisma/client";
 import { env } from "process";
-import kyselyExtension from "prisma-extension-kysely";
-import {
-  Kysely,
-  PostgresAdapter,
-  PostgresIntrospector,
-  PostgresQueryCompiler,
-} from "kysely";
-import { DB } from ".";
+import { logger } from "./server";
+import { withPostgresApplicationName } from "./server/postgresApplicationName";
+import { postgresConnectionRetryExtension } from "./dbConnectionRetry";
 
-// Instantiated according to the Prisma documentation
-// https://www.prisma.io/docs/orm/more/help-and-troubleshooting/help-articles/nextjs-prisma-client-dev-practices
+export class PrismaClientSingleton {
+  private static instance: PrismaClient;
 
-const prismaClientSingleton = () => {
-  return new PrismaClient({
-    log:
-      env.NODE_ENV === "development"
-        ? ["query", "error", "warn"]
-        : ["error", "warn"],
-  });
-};
+  public static getInstance(): PrismaClient {
+    if (PrismaClientSingleton.instance) {
+      return PrismaClientSingleton.instance;
+    }
 
-declare global {
-  // eslint-disable-next-line no-var
-  var prisma: undefined | ReturnType<typeof prismaClientSingleton>;
+    PrismaClientSingleton.instance = createPrismaInstance();
+
+    return PrismaClientSingleton.instance;
+  }
 }
 
-export const prisma = globalThis.prisma ?? prismaClientSingleton();
+const createPrismaInstance = () => {
+  const client = new PrismaClient<
+    Prisma.PrismaClientOptions,
+    "warn" | "error" | "query"
+  >({
+    datasourceUrl: withPostgresApplicationName(env.DATABASE_URL),
+    log: [
+      { emit: "event", level: "query" },
+      { emit: "event", level: "error" },
+      { emit: "event", level: "warn" },
+    ],
+    // Secret-bearing columns are excluded from every query result by default.
+    // Delivery paths that need them must opt back in with an explicit `select`.
+    omit: {
+      dataset: {
+        remoteExperimentSecretKey: true,
+        remoteExperimentRequestHeaders: true,
+      },
+      gatewayAiConnection: {
+        encryptedCredential: true,
+      },
+    },
+  });
 
-export const kyselyPrisma = prisma.$extends(
-  kyselyExtension({
-    kysely: (driver) =>
-      new Kysely<DB>({
-        dialect: {
-          // This is where the magic happens!
-          createDriver: () => driver,
-          // Don't forget to customize these to match your database!
-          createAdapter: () => new PostgresAdapter(),
-          createIntrospector: (db) => new PostgresIntrospector(db),
-          createQueryCompiler: () => new PostgresQueryCompiler(),
-        },
-      }),
-  })
-);
+  if (env.NODE_ENV === "development") {
+    client.$on("query", (event) => {
+      logger.info(`prisma:query ${event.query}, ${event.duration}ms`);
+    });
+  }
+
+  client.$on("warn", (event) => {
+    logger.warn(`prisma:warn ${event.message}`);
+  });
+
+  client.$on("error", (event) => {
+    logger.error(`prisma:error ${event.message}`);
+  });
+
+  // A query extension leaves model and result types untouched, so the
+  // extended client is still a PrismaClient for every caller.
+  return client.$extends(
+    postgresConnectionRetryExtension,
+  ) as unknown as PrismaClient;
+};
+
+declare const globalThis: {
+  prismaGlobal: PrismaClient | undefined;
+} & typeof global;
+
+// eslint-disable-next-line turbo/no-undeclared-env-vars
+if (process.env.NODE_ENV === "development") {
+  if (globalThis.prismaGlobal === undefined) {
+    globalThis.prismaGlobal = createPrismaInstance();
+  }
+}
+
+export const prisma =
+  globalThis.prismaGlobal ?? PrismaClientSingleton.getInstance();
 
 export * from "@prisma/client";
-
-if (process.env.NODE_ENV !== "production") globalThis.prisma = prisma;
